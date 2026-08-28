@@ -24,10 +24,10 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TD_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 if not TOKEN or not CHAT_ID or not TD_KEY:
-    raise ValueError("TELEGRAM_TOKEN, TELEGRAM_CHAT_ID and TWELVEDATA_API_KEY must be set")
+    raise ValueError("Missing required environment variables")
 
 EAT = pytz.timezone("Africa/Nairobi")
-SIGNAL_INTERVAL = 900  # 15 minutes
+SIGNAL_INTERVAL = 900
 
 app = Flask(__name__)
 
@@ -35,15 +35,12 @@ app = Flask(__name__)
 def health():
     return "BRAX ADVANCED DESK - ONLINE", 200
 
-# ------------------------------------------------------------
-# Twelve Data Feed
-# ------------------------------------------------------------
 class TwelveDataFeed:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=18))
 
     async def get_quote(self, symbol: str) -> float:
         url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TD_KEY}"
@@ -51,6 +48,7 @@ class TwelveDataFeed:
             async with self.session.get(url) as r:
                 data = await r.json()
                 if data.get("status") == "error":
+                    logger.warning(f"Quote error {symbol}: {data.get('message')}")
                     return 0.0
                 price = data.get("close") or data.get("price")
                 return float(price) if price else 0.0
@@ -58,30 +56,44 @@ class TwelveDataFeed:
             logger.error(f"Quote {symbol}: {e}")
             return 0.0
 
-    async def get_candles(self, symbol: str, interval: str = "5min", outputsize: int = 90) -> pd.DataFrame:
-        url = (
-            f"https://api.twelvedata.com/time_series"
-            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TD_KEY}"
-        )
-        try:
-            async with self.session.get(url) as r:
-                data = await r.json()
-                if data.get("status") == "error" or "values" not in data:
-                    return pd.DataFrame()
-                df = pd.DataFrame(data["values"])
-                df = df.rename(columns={"open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"})
-                for col in ["o", "h", "l", "c"]:
-                    df[col] = df[col].astype(float)
-                df["v"] = df.get("v", 0).astype(float)
-                df = df.iloc[::-1].reset_index(drop=True)
-                return df
-        except Exception as e:
-            logger.error(f"Candles {symbol}: {e}")
-            return pd.DataFrame()
+    async def get_candles(self, symbol: str) -> pd.DataFrame:
+        # Try 5min first, then 15min as fallback
+        for interval, size in [("5min", 80), ("15min", 50)]:
+            url = (
+                f"https://api.twelvedata.com/time_series"
+                f"?symbol={symbol}&interval={interval}&outputsize={size}&apikey={TD_KEY}"
+            )
+            try:
+                async with self.session.get(url) as r:
+                    data = await r.json()
+                    if data.get("status") == "error":
+                        logger.warning(f"Candles {interval} {symbol}: {data.get('message')}")
+                        continue
+                    if "values" not in data or not data["values"]:
+                        continue
 
-# ------------------------------------------------------------
-# Analysis
-# ------------------------------------------------------------
+                    df = pd.DataFrame(data["values"])
+                    df = df.rename(columns={"open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"})
+                    for col in ["o", "h", "l", "c"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df["v"] = pd.to_numeric(df.get("v", 0), errors="coerce").fillna(0)
+                    df = df.dropna(subset=["o", "h", "l", "c"])
+                    df = df.iloc[::-1].reset_index(drop=True)
+                    if len(df) >= 15:
+                        logger.info(f"Got {len(df)} candles for {symbol} ({interval})")
+                        return df
+            except Exception as e:
+                logger.error(f"Candles error {symbol}: {e}")
+        return pd.DataFrame()
+
+def calc_rsi(series: pd.Series, period: int = 14) -> float:
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss
+    val = 100 - (100 / (1 + rs.iloc[-1]))
+    return float(val) if not np.isnan(val) else 50.0
+
 @dataclass
 class Signal:
     name: str
@@ -102,19 +114,11 @@ class Signal:
     ema21: float
     change_pct: float
     next_15min: str
-    df: pd.DataFrame
-
-def calc_rsi(series: pd.Series, period: int = 14) -> float:
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss
-    val = 100 - (100 / (1 + rs.iloc[-1]))
-    return float(val) if not np.isnan(val) else 50.0
+    has_structure: bool
 
 async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
     price = await feed.get_quote(symbol)
-    df = await feed.get_candles(symbol, "5min", 90)
+    df = await feed.get_candles(symbol)
 
     now = datetime.now(EAT)
     h = now.hour + now.minute / 60
@@ -127,18 +131,33 @@ async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
     else:
         sess = "OFF-HOURS"
 
-    if price <= 0 or df.empty or len(df) < 25:
+    # Fallback if no candle data
+    if price <= 0:
         return Signal(
-            name=name, price=price, direction="NEUTRAL", conviction=1,
-            session=sess, regime="NO DATA", cvd=0.0,
+            name=name, price=0.0, direction="NEUTRAL", conviction=1,
+            session=sess, regime="NO PRICE DATA", cvd=0.0,
+            entry=0, sl=0, t1=0, t2=0, day_bias="NEUTRAL",
+            atr=0, rsi=50, ema9=0, ema21=0, change_pct=0,
+            next_15min="No price data available.", has_structure=False
+        )
+
+    if df.empty or len(df) < 15:
+        # We have price but no structure → simple briefing
+        return Signal(
+            name=name, price=price, direction="NEUTRAL", conviction=2,
+            session=sess, regime="LIMITED DATA", cvd=0.0,
             entry=price, sl=price, t1=price, t2=price,
             day_bias="NEUTRAL", atr=0.0, rsi=50.0,
             ema9=price, ema21=price, change_pct=0.0,
-            next_15min="Insufficient data for short-term outlook.",
-            df=df
+            next_15min=f"Price is at {price:.1f}. Waiting for clearer structure. Expect range-bound action in the next 15 minutes.",
+            has_structure=False
         )
 
-    tr = np.maximum(df["h"] - df["l"], np.maximum(abs(df["h"] - df["c"].shift()), abs(df["l"] - df["c"].shift())))
+    # Full analysis
+    tr = np.maximum(
+        df["h"] - df["l"],
+        np.maximum(abs(df["h"] - df["c"].shift()), abs(df["l"] - df["c"].shift()))
+    )
     atr = float(tr.rolling(14).mean().iloc[-1])
 
     rsi = calc_rsi(df["c"])
@@ -150,18 +169,17 @@ async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
     cvd = float(df["buy_vol"].tail(12).sum() - df["sell_vol"].tail(12).sum())
 
     vol_mean = float(df["v"].tail(20).mean()) or 1.0
-    regime = "TRENDING" if abs(cvd) > vol_mean * 0.55 else "RANGING / COMPRESSING"
+    regime = "TRENDING" if abs(cvd) > vol_mean * 0.5 else "RANGING / COMPRESSING"
 
-    # Scoring
     score = 0
     bull = bear = 0
 
     if cvd > 0:
         bull += 1
-        score += 2 if abs(cvd) > vol_mean * 0.35 else 1
+        score += 2 if abs(cvd) > vol_mean * 0.3 else 1
     else:
         bear += 1
-        score += 2 if abs(cvd) > vol_mean * 0.35 else 1
+        score += 2 if abs(cvd) > vol_mean * 0.3 else 1
 
     if ema9 > ema21:
         bull += 1
@@ -170,10 +188,10 @@ async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
         bear += 1
         score += 1
 
-    if rsi < 32:
+    if rsi < 33:
         bull += 1
         score += 1
-    elif rsi > 68:
+    elif rsi > 67:
         bear += 1
         score += 1
 
@@ -184,7 +202,6 @@ async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
     if abs(bull - bear) <= 1:
         score = max(0, score - 2)
 
-    # Levels
     if direction == "BUY":
         entry = price - atr * 0.12
         sl = entry - atr * 1.35
@@ -197,30 +214,21 @@ async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
         t2 = entry - atr * 3.4
 
     day_bias = "BULLISH" if ema9 > ema21 else "BEARISH"
-    change_pct = ((price - float(df["o"].iloc[0])) / float(df["o"].iloc[0])) * 100
+    change_pct = ((price - float(df["o"].iloc[0])) / float(df["o"].iloc[0])) * 100 if float(df["o"].iloc[0]) > 0 else 0.0
 
-    # ---------- Next 15 minutes outlook ----------
-    if regime == "RANGING / COMPRESSING":
+    # Next 15 min outlook
+    if regime.startswith("RANGING"):
         next_15 = (
-            f"Expect continued range-bound action or a potential breakout. "
-            f"Watch {price + atr*0.6:.1f} on the upside and {price - atr*0.6:.1f} on the downside. "
-            f"Low directional edge in the next 15 minutes."
+            f"Expect continued consolidation. "
+            f"Key short-term levels: {price - atr*0.5:.1f} support and {price + atr*0.5:.1f} resistance. "
+            f"Breakout risk is elevated."
         )
     elif direction == "SELL" and score >= 5:
-        next_15 = (
-            f"Short-term bias remains lower. "
-            f"Price is more likely to test {t1:.1f} than to rally aggressively in the next 15 minutes."
-        )
+        next_15 = f"Short-term pressure remains to the downside. More likely to test {t1:.1f} than to rally strongly."
     elif direction == "BUY" and score >= 5:
-        next_15 = (
-            f"Short-term bias remains higher. "
-            f"Price is more likely to push toward {t1:.1f} in the next 15 minutes if momentum holds."
-        )
+        next_15 = f"Short-term bias higher. More likely to push toward {t1:.1f} if momentum continues."
     else:
-        next_15 = (
-            f"Mixed signals. Expect choppy price action around current levels "
-            f"({price - atr*0.4:.1f} – {price + atr*0.4:.1f}) over the next 15 minutes."
-        )
+        next_15 = f"Mixed conditions. Expect choppy action between {price - atr*0.4:.1f} and {price + atr*0.4:.1f} over the next 15 minutes."
 
     return Signal(
         name=name, price=price, direction=direction, conviction=min(score, 10),
@@ -228,20 +236,21 @@ async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
         entry=entry, sl=sl, t1=t1, t2=t2,
         day_bias=day_bias, atr=atr, rsi=rsi,
         ema9=ema9, ema21=ema21, change_pct=change_pct,
-        next_15min=next_15, df=df
+        next_15min=next_15, has_structure=True
     )
 
-# ------------------------------------------------------------
-# Text + Voice
-# ------------------------------------------------------------
 def make_recap(sig: Signal) -> str:
     time_str = datetime.now(EAT).strftime("%H:%M EAT")
 
     flow = "Volume delta relatively balanced."
     if sig.cvd > 0:
-        flow = "Buying pressure visible in recent volume delta."
+        flow = "Buying pressure in recent volume delta."
     elif sig.cvd < 0:
-        flow = "Selling pressure visible in recent volume delta."
+        flow = "Selling pressure in recent volume delta."
+
+    structure_line = f"EMA9/21: {'Bullish' if sig.ema9 > sig.ema21 else 'Bearish'} | RSI: {sig.rsi:.1f} | ATR: {sig.atr:.2f}"
+    if not sig.has_structure:
+        structure_line = "Structure data limited"
 
     return f"""
 <b>BRAX ADVANCED DESK — {sig.name}</b>
@@ -256,7 +265,7 @@ CVD Proxy: <b>{sig.cvd:.1f}</b>
 → {flow}
 
 <b>STRUCTURE</b>
-EMA9/21: {"Bullish" if sig.ema9 > sig.ema21 else "Bearish"} | RSI: {sig.rsi:.1f} | ATR: {sig.atr:.2f}
+{structure_line}
 
 <b>KEY LEVELS</b>
 Entry Zone: <b>${sig.entry:.2f}</b>
@@ -276,15 +285,12 @@ def make_voice(sig: Signal, path: str):
     t = datetime.now(EAT).strftime("%I:%M %p")
     text = (
         f"Advanced desk briefing at {t}. "
-        f"{sig.name} is currently trading at {sig.price:.1f} dollars. "
-        f"We are in the {sig.session} session. "
-        f"Day bias is {sig.day_bias}. "
-        f"The model carries a {sig.direction} bias with conviction {sig.conviction} out of 10. "
-        f"For the next fifteen minutes: {sig.next_15min} "
-        f"Preferred entry near {sig.entry:.1f}, stop at {sig.sl:.1f}."
+        f"{sig.name} is trading at {sig.price:.1f}. "
+        f"Session is {sig.session}. Day bias is {sig.day_bias}. "
+        f"Current view is {sig.direction} with conviction {sig.conviction} out of 10. "
+        f"For the next fifteen minutes: {sig.next_15min}"
     )
-    tts = gTTS(text=text, lang='en', slow=False)
-    tts.save(path)
+    gTTS(text=text, lang='en', slow=False).save(path)
 
 class Alerts:
     def __init__(self):
@@ -297,7 +303,7 @@ class Alerts:
             }, timeout=20):
                 pass
         except Exception as e:
-            logger.error(f"Text error: {e}")
+            logger.error(f"Text: {e}")
 
     async def voice(self, path: str, session):
         try:
@@ -308,7 +314,7 @@ class Alerts:
                 async with session.post(f"{self.base}/sendVoice", data=data, timeout=40):
                     pass
         except Exception as e:
-            logger.error(f"Voice error: {e}")
+            logger.error(f"Voice: {e}")
 
 async def main_loop():
     feed = TwelveDataFeed()
@@ -316,30 +322,24 @@ async def main_loop():
     alerts = Alerts()
 
     await alerts.text(
-        "<b>BRAX ADVANCED DESK ONLINE</b>\n"
-        "Real-time price + 15-min outlook + voice briefing activated.\n"
-        "First full update in \~25 seconds...",
+        "<b>BRAX ADVANCED DESK RESTARTED</b>\n"
+        "More resilient candle handling activated.\n"
+        "First update in \~20 seconds...",
         feed.session
     )
 
-    assets = [
-        ("XAU/USD", "GOLD"),
-        ("BTC/USD", "BITCOIN"),
-    ]
+    assets = [("XAU/USD", "GOLD"), ("BTC/USD", "BITCOIN")]
 
-    await asyncio.sleep(25)
+    await asyncio.sleep(20)
 
     for symbol, name in assets:
         try:
             sig = await analyze(feed, symbol, name)
-            recap = make_recap(sig)
-            await alerts.text(recap, feed.session)
-
-            voice_path = f"/tmp/{name.lower()}_voice.mp3"
-            make_voice(sig, voice_path)
-            await alerts.voice(voice_path, feed.session)
-
-            logger.info(f"First advanced update → {name}")
+            await alerts.text(make_recap(sig), feed.session)
+            path = f"/tmp/{name.lower()}.mp3"
+            make_voice(sig, path)
+            await alerts.voice(path, feed.session)
+            logger.info(f"Update sent → {name} | ${sig.price:.2f}")
         except Exception as e:
             logger.error(f"First {name}: {e}")
 
@@ -350,16 +350,13 @@ async def main_loop():
                 try:
                     sig = await analyze(feed, symbol, name)
                     await alerts.text(make_recap(sig), feed.session)
-
-                    voice_path = f"/tmp/{name.lower()}_voice.mp3"
-                    make_voice(sig, voice_path)
-                    await alerts.voice(voice_path, feed.session)
-
-                    logger.info(f"Update → {name} | {sig.direction} | Conv {sig.conviction}")
+                    path = f"/tmp/{name.lower()}.mp3"
+                    make_voice(sig, path)
+                    await alerts.voice(path, feed.session)
                 except Exception as e:
                     logger.error(f"Cycle {name}: {e}")
         except Exception as e:
-            logger.error(f"Main loop: {e}")
+            logger.error(f"Loop: {e}")
             await asyncio.sleep(20)
 
 def run_flask():
