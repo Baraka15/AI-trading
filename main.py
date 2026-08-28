@@ -17,30 +17,31 @@ logging.basicConfig(
     format='%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("BraxAdvanced")
+logger = logging.getLogger("BraxSmart")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TD_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 if not TOKEN or not CHAT_ID or not TD_KEY:
-    raise ValueError("Missing required environment variables")
+    raise ValueError("Missing TELEGRAM_TOKEN, TELEGRAM_CHAT_ID or TWELVEDATA_API_KEY")
 
 EAT = pytz.timezone("Africa/Nairobi")
-SIGNAL_INTERVAL = 900
+SIGNAL_INTERVAL = 900  # 15 minutes
 
 app = Flask(__name__)
 
 @app.route("/")
 def health():
-    return "BRAX ADVANCED DESK - ONLINE", 200
+    return "BRAX SMART DESK - ONLINE", 200
 
 class TwelveDataFeed:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self.last_candle_attempt = 0
 
     async def start(self):
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=18))
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
 
     async def get_quote(self, symbol: str) -> float:
         url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TD_KEY}"
@@ -48,43 +49,46 @@ class TwelveDataFeed:
             async with self.session.get(url) as r:
                 data = await r.json()
                 if data.get("status") == "error":
-                    logger.warning(f"Quote error {symbol}: {data.get('message')}")
+                    logger.warning(f"Quote {symbol}: {data.get('message')}")
                     return 0.0
                 price = data.get("close") or data.get("price")
                 return float(price) if price else 0.0
         except Exception as e:
-            logger.error(f"Quote {symbol}: {e}")
+            logger.error(f"Quote error {symbol}: {e}")
             return 0.0
 
     async def get_candles(self, symbol: str) -> pd.DataFrame:
-        # Try 5min first, then 15min as fallback
-        for interval, size in [("5min", 80), ("15min", 50)]:
-            url = (
-                f"https://api.twelvedata.com/time_series"
-                f"?symbol={symbol}&interval={interval}&outputsize={size}&apikey={TD_KEY}"
-            )
-            try:
-                async with self.session.get(url) as r:
-                    data = await r.json()
-                    if data.get("status") == "error":
-                        logger.warning(f"Candles {interval} {symbol}: {data.get('message')}")
-                        continue
-                    if "values" not in data or not data["values"]:
-                        continue
+        # Only try candles every other cycle to save credits
+        now = datetime.now().timestamp()
+        if now - self.last_candle_attempt < 800:  # roughly every 13+ minutes
+            return pd.DataFrame()
 
-                    df = pd.DataFrame(data["values"])
-                    df = df.rename(columns={"open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"})
-                    for col in ["o", "h", "l", "c"]:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-                    df["v"] = pd.to_numeric(df.get("v", 0), errors="coerce").fillna(0)
-                    df = df.dropna(subset=["o", "h", "l", "c"])
-                    df = df.iloc[::-1].reset_index(drop=True)
-                    if len(df) >= 15:
-                        logger.info(f"Got {len(df)} candles for {symbol} ({interval})")
-                        return df
-            except Exception as e:
-                logger.error(f"Candles error {symbol}: {e}")
-        return pd.DataFrame()
+        self.last_candle_attempt = now
+
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}&interval=15min&outputsize=40&apikey={TD_KEY}"
+        )
+        try:
+            async with self.session.get(url) as r:
+                data = await r.json()
+                if data.get("status") == "error":
+                    logger.warning(f"Candles {symbol}: {data.get('message')}")
+                    return pd.DataFrame()
+                if "values" not in data or not data["values"]:
+                    return pd.DataFrame()
+
+                df = pd.DataFrame(data["values"])
+                df = df.rename(columns={"open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"})
+                for col in ["o", "h", "l", "c"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df["v"] = pd.to_numeric(df.get("v", 0), errors="coerce").fillna(0)
+                df = df.dropna(subset=["o", "h", "l", "c"])
+                df = df.iloc[::-1].reset_index(drop=True)
+                return df
+        except Exception as e:
+            logger.error(f"Candles error {symbol}: {e}")
+            return pd.DataFrame()
 
 def calc_rsi(series: pd.Series, period: int = 14) -> float:
     delta = series.diff()
@@ -102,19 +106,14 @@ class Signal:
     conviction: int
     session: str
     regime: str
-    cvd: float
     entry: float
     sl: float
     t1: float
-    t2: float
     day_bias: str
-    atr: float
     rsi: float
-    ema9: float
-    ema21: float
-    change_pct: float
+    atr: float
     next_15min: str
-    has_structure: bool
+    full_data: bool
 
 async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
     price = await feed.get_quote(symbol)
@@ -131,165 +130,150 @@ async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
     else:
         sess = "OFF-HOURS"
 
-    # Fallback if no candle data
     if price <= 0:
         return Signal(
             name=name, price=0.0, direction="NEUTRAL", conviction=1,
-            session=sess, regime="NO PRICE DATA", cvd=0.0,
-            entry=0, sl=0, t1=0, t2=0, day_bias="NEUTRAL",
-            atr=0, rsi=50, ema9=0, ema21=0, change_pct=0,
-            next_15min="No price data available.", has_structure=False
+            session=sess, regime="NO PRICE", entry=0, sl=0, t1=0,
+            day_bias="NEUTRAL", rsi=50, atr=0,
+            next_15min="No live price available.", full_data=False
         )
 
-    if df.empty or len(df) < 15:
-        # We have price but no structure → simple briefing
+    # ----- Limited data path (most common on free tier) -----
+    if df.empty or len(df) < 12:
         return Signal(
-            name=name, price=price, direction="NEUTRAL", conviction=2,
-            session=sess, regime="LIMITED DATA", cvd=0.0,
-            entry=price, sl=price, t1=price, t2=price,
-            day_bias="NEUTRAL", atr=0.0, rsi=50.0,
-            ema9=price, ema21=price, change_pct=0.0,
-            next_15min=f"Price is at {price:.1f}. Waiting for clearer structure. Expect range-bound action in the next 15 minutes.",
-            has_structure=False
+            name=name,
+            price=price,
+            direction="NEUTRAL",
+            conviction=2,
+            session=sess,
+            regime="PRICE ONLY",
+            entry=price,
+            sl=price,
+            t1=price,
+            day_bias="NEUTRAL",
+            rsi=50.0,
+            atr=0.0,
+            next_15min=(
+                f"{name} is currently at ${price:.1f}. "
+                f"Full structure data is temporarily limited. "
+                f"Expect range-bound or low-momentum action over the next 15 minutes. "
+                f"Wait for clearer directional confirmation."
+            ),
+            full_data=False
         )
 
-    # Full analysis
+    # ----- Full data path -----
     tr = np.maximum(
         df["h"] - df["l"],
         np.maximum(abs(df["h"] - df["c"].shift()), abs(df["l"] - df["c"].shift()))
     )
     atr = float(tr.rolling(14).mean().iloc[-1])
-
     rsi = calc_rsi(df["c"])
     ema9 = float(df["c"].ewm(span=9).mean().iloc[-1])
     ema21 = float(df["c"].ewm(span=21).mean().iloc[-1])
 
-    df["buy_vol"] = np.where(df["c"] > df["o"], df["v"], 0)
-    df["sell_vol"] = np.where(df["c"] < df["o"], df["v"], 0)
-    cvd = float(df["buy_vol"].tail(12).sum() - df["sell_vol"].tail(12).sum())
+    day_bias = "BULLISH" if ema9 > ema21 else "BEARISH"
+    direction = "BUY" if ema9 > ema21 and rsi < 60 else "SELL" if ema9 < ema21 and rsi > 40 else "NEUTRAL"
 
-    vol_mean = float(df["v"].tail(20).mean()) or 1.0
-    regime = "TRENDING" if abs(cvd) > vol_mean * 0.5 else "RANGING / COMPRESSING"
-
-    score = 0
-    bull = bear = 0
-
-    if cvd > 0:
-        bull += 1
-        score += 2 if abs(cvd) > vol_mean * 0.3 else 1
-    else:
-        bear += 1
-        score += 2 if abs(cvd) > vol_mean * 0.3 else 1
-
-    if ema9 > ema21:
-        bull += 1
+    score = 3
+    if abs(ema9 - ema21) / price > 0.001:
         score += 1
-    else:
-        bear += 1
+    if rsi < 35 or rsi > 65:
         score += 1
-
-    if rsi < 33:
-        bull += 1
-        score += 1
-    elif rsi > 67:
-        bear += 1
-        score += 1
-
     if sess in ("LONDON", "NY KILLZONE"):
         score += 1
 
-    direction = "BUY" if bull > bear else "SELL"
-    if abs(bull - bear) <= 1:
-        score = max(0, score - 2)
-
     if direction == "BUY":
-        entry = price - atr * 0.12
-        sl = entry - atr * 1.35
-        t1 = entry + atr * 2.1
-        t2 = entry + atr * 3.4
+        entry = price - atr * 0.15
+        sl = entry - atr * 1.3
+        t1 = entry + atr * 2.0
+    elif direction == "SELL":
+        entry = price + atr * 0.15
+        sl = entry + atr * 1.3
+        t1 = entry - atr * 2.0
     else:
-        entry = price + atr * 0.12
-        sl = entry + atr * 1.35
-        t1 = entry - atr * 2.1
-        t2 = entry - atr * 3.4
+        entry = sl = t1 = price
 
-    day_bias = "BULLISH" if ema9 > ema21 else "BEARISH"
-    change_pct = ((price - float(df["o"].iloc[0])) / float(df["o"].iloc[0])) * 100 if float(df["o"].iloc[0]) > 0 else 0.0
-
-    # Next 15 min outlook
-    if regime.startswith("RANGING"):
+    if direction == "NEUTRAL":
         next_15 = (
-            f"Expect continued consolidation. "
-            f"Key short-term levels: {price - atr*0.5:.1f} support and {price + atr*0.5:.1f} resistance. "
-            f"Breakout risk is elevated."
+            f"Mixed structure. Expect choppy movement around {price:.1f} "
+            f"in the next 15 minutes. Key zone: {price-atr*0.5:.1f} – {price+atr*0.5:.1f}."
         )
-    elif direction == "SELL" and score >= 5:
-        next_15 = f"Short-term pressure remains to the downside. More likely to test {t1:.1f} than to rally strongly."
-    elif direction == "BUY" and score >= 5:
-        next_15 = f"Short-term bias higher. More likely to push toward {t1:.1f} if momentum continues."
+    elif direction == "BUY":
+        next_15 = f"Short-term bias higher. More likely to work toward {t1:.1f} if momentum holds."
     else:
-        next_15 = f"Mixed conditions. Expect choppy action between {price - atr*0.4:.1f} and {price + atr*0.4:.1f} over the next 15 minutes."
+        next_15 = f"Short-term bias lower. More likely to test {t1:.1f} than to rally strongly."
 
     return Signal(
         name=name, price=price, direction=direction, conviction=min(score, 10),
-        session=sess, regime=regime, cvd=cvd,
-        entry=entry, sl=sl, t1=t1, t2=t2,
-        day_bias=day_bias, atr=atr, rsi=rsi,
-        ema9=ema9, ema21=ema21, change_pct=change_pct,
-        next_15min=next_15, has_structure=True
+        session=sess, regime="STRUCTURE AVAILABLE", entry=entry, sl=sl, t1=t1,
+        day_bias=day_bias, rsi=rsi, atr=atr,
+        next_15min=next_15, full_data=True
     )
 
 def make_recap(sig: Signal) -> str:
     time_str = datetime.now(EAT).strftime("%H:%M EAT")
 
-    flow = "Volume delta relatively balanced."
-    if sig.cvd > 0:
-        flow = "Buying pressure in recent volume delta."
-    elif sig.cvd < 0:
-        flow = "Selling pressure in recent volume delta."
-
-    structure_line = f"EMA9/21: {'Bullish' if sig.ema9 > sig.ema21 else 'Bearish'} | RSI: {sig.rsi:.1f} | ATR: {sig.atr:.2f}"
-    if not sig.has_structure:
-        structure_line = "Structure data limited"
-
-    return f"""
-<b>BRAX ADVANCED DESK — {sig.name}</b>
+    if not sig.full_data:
+        return f"""
+<b>BRAX SMART DESK — {sig.name}</b>
 <code>{time_str} | {sig.session}</code>
 
-<b>Current Price:</b> ${sig.price:.2f}  ({sig.change_pct:+.2f}%)
+<b>Live Price:</b> ${sig.price:.2f}
+
+<b>Status:</b> Full candle structure temporarily limited (free-tier constraint)
+
+<b>NEXT 15 MINUTES</b>
+{sig.next_15min}
+
+<b>DESK VIEW</b>
+Neutral / Observing — Conviction {sig.conviction}/10
+
+<code>Voice briefing follows • Next update in 15 minutes</code>
+""".strip()
+
+    return f"""
+<b>BRAX SMART DESK — {sig.name}</b>
+<code>{time_str} | {sig.session}</code>
+
+<b>Live Price:</b> ${sig.price:.2f}
 <b>Day Bias:</b> {sig.day_bias}
 <b>Regime:</b> {sig.regime}
 
-<b>ORDER FLOW</b>
-CVD Proxy: <b>{sig.cvd:.1f}</b>
-→ {flow}
-
 <b>STRUCTURE</b>
-{structure_line}
+RSI: {sig.rsi:.1f} | ATR: {sig.atr:.2f}
 
 <b>KEY LEVELS</b>
-Entry Zone: <b>${sig.entry:.2f}</b>
-Invalidation: ${sig.sl:.2f}
-Target 1: ${sig.t1:.2f} | Target 2: ${sig.t2:.2f}
+Entry: <b>${sig.entry:.2f}</b>
+Stop: ${sig.sl:.2f}
+Target: ${sig.t1:.2f}
 
 <b>NEXT 15 MINUTES OUTLOOK</b>
 {sig.next_15min}
 
 <b>DESK VIEW</b>
-{sig.direction} bias — Conviction <b>{sig.conviction}/10</b>
+{sig.direction} — Conviction <b>{sig.conviction}/10</b>
 
 <code>Voice briefing follows • Next update in 15 minutes</code>
 """.strip()
 
 def make_voice(sig: Signal, path: str):
     t = datetime.now(EAT).strftime("%I:%M %p")
-    text = (
-        f"Advanced desk briefing at {t}. "
-        f"{sig.name} is trading at {sig.price:.1f}. "
-        f"Session is {sig.session}. Day bias is {sig.day_bias}. "
-        f"Current view is {sig.direction} with conviction {sig.conviction} out of 10. "
-        f"For the next fifteen minutes: {sig.next_15min}"
-    )
+    if not sig.full_data:
+        text = (
+            f"Smart desk update at {t}. "
+            f"{sig.name} is trading at {sig.price:.1f}. "
+            f"Full structure data is currently limited. "
+            f"{sig.next_15min}"
+        )
+    else:
+        text = (
+            f"Smart desk briefing at {t}. "
+            f"{sig.name} is at {sig.price:.1f}. "
+            f"Day bias is {sig.day_bias}. "
+            f"Current view is {sig.direction} with conviction {sig.conviction}. "
+            f"For the next fifteen minutes: {sig.next_15min}"
+        )
     gTTS(text=text, lang='en', slow=False).save(path)
 
 class Alerts:
@@ -303,7 +287,7 @@ class Alerts:
             }, timeout=20):
                 pass
         except Exception as e:
-            logger.error(f"Text: {e}")
+            logger.error(f"Text error: {e}")
 
     async def voice(self, path: str, session):
         try:
@@ -314,7 +298,7 @@ class Alerts:
                 async with session.post(f"{self.base}/sendVoice", data=data, timeout=40):
                     pass
         except Exception as e:
-            logger.error(f"Voice: {e}")
+            logger.error(f"Voice error: {e}")
 
 async def main_loop():
     feed = TwelveDataFeed()
@@ -322,8 +306,8 @@ async def main_loop():
     alerts = Alerts()
 
     await alerts.text(
-        "<b>BRAX ADVANCED DESK RESTARTED</b>\n"
-        "More resilient candle handling activated.\n"
+        "<b>BRAX SMART DESK ONLINE</b>\n"
+        "Optimized for free-tier limits.\n"
         "First update in \~20 seconds...",
         feed.session
     )
@@ -339,7 +323,6 @@ async def main_loop():
             path = f"/tmp/{name.lower()}.mp3"
             make_voice(sig, path)
             await alerts.voice(path, feed.session)
-            logger.info(f"Update sent → {name} | ${sig.price:.2f}")
         except Exception as e:
             logger.error(f"First {name}: {e}")
 
@@ -353,6 +336,7 @@ async def main_loop():
                     path = f"/tmp/{name.lower()}.mp3"
                     make_voice(sig, path)
                     await alerts.voice(path, feed.session)
+                    logger.info(f"Sent → {name} | ${sig.price:.2f} | full={sig.full_data}")
                 except Exception as e:
                     logger.error(f"Cycle {name}: {e}")
         except Exception as e:
