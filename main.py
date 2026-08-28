@@ -26,8 +26,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BraxOrderFlow")
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TOKEN = os.getenv("8747660197:AAEqz0C7bg2ntLm_Hf0r4o7NuXVicSK7P5M")
+CHAT_ID = os.getenv("7168775421")
 if not TOKEN or not CHAT_ID:
     raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
 
