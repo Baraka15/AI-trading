@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional, List
+from typing import Deque, Dict, Optional
 import numpy as np
 import pandas as pd
 import aiohttp
@@ -19,6 +19,9 @@ import pytz
 from flask import Flask
 from threading import Thread
 
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s',
@@ -26,10 +29,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BraxOrderFlow")
 
-TOKEN = os.getenv("8747660197:AAEqz0C7bg2ntLm_Hf0r4o7NuXVicSK7P5M")
-CHAT_ID = os.getenv("7168775421")
+# ------------------------------------------------------------
+# Environment Variables (CORRECT WAY)
+# ------------------------------------------------------------
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 if not TOKEN or not CHAT_ID:
-    raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
+    raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in environment variables")
 
 EAT = pytz.timezone("Africa/Nairobi")
 SIGNAL_INTERVAL = int(os.getenv("SIGNAL_INTERVAL", 180))
@@ -41,16 +48,16 @@ app = Flask(__name__)
 def health():
     return "BRAX REAL-TIME ORDER FLOW ENGINE - ONLINE", 200
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Live Order Flow State
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 @dataclass
 class OrderFlowState:
     symbol: str
     cvd: float = 0.0
     buy_vol: float = 0.0
     sell_vol: float = 0.0
-    imbalance: float = 0.0          # bid_vol / (bid_vol + ask_vol)  → >0.55 bullish
+    imbalance: float = 0.0
     large_buy: int = 0
     large_sell: int = 0
     last_price: float = 0.0
@@ -58,16 +65,15 @@ class OrderFlowState:
     last_update: float = 0.0
 
     def reset_window(self):
-        """Soft reset every evaluation cycle so CVD is recent"""
         self.cvd *= 0.35
         self.buy_vol *= 0.35
         self.sell_vol *= 0.35
         self.large_buy = max(0, self.large_buy - 1)
         self.large_sell = max(0, self.large_sell - 1)
 
-# ---------------------------------------------------------------------------
-# Real-time WebSocket feed
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# Real-time WebSocket + REST Feed
+# ------------------------------------------------------------
 class LiveFeed:
     def __init__(self):
         self.states: Dict[str, OrderFlowState] = {
@@ -93,7 +99,7 @@ class LiveFeed:
                         data = json.loads(msg)
                         price = float(data["p"])
                         qty = float(data["q"])
-                        is_buyer_maker = data["m"]  # True = sell aggression
+                        is_buyer_maker = data["m"]
 
                         state = self.states[symbol]
                         state.last_price = price - 2.8 if symbol == "PAXGUSDT" else price
@@ -116,7 +122,6 @@ class LiveFeed:
                 await asyncio.sleep(3)
 
     async def _depth_loop(self):
-        """Poll order book every 2–3 seconds for imbalance"""
         while self.running:
             for symbol in self.states:
                 try:
@@ -140,20 +145,20 @@ class LiveFeed:
                 if resp.status == 200:
                     data = await resp.json()
                     df = pd.DataFrame(data, columns=[
-                        't','o','h','l','c','v','ct','qav','n','tbb','tbq','x'
+                        't', 'o', 'h', 'l', 'c', 'v', 'ct', 'qav', 'n', 'tbb', 'tbq', 'x'
                     ])
-                    for col in ['o','h','l','c','v']:
+                    for col in ['o', 'h', 'l', 'c', 'v']:
                         df[col] = df[col].astype(float)
                     if symbol == "PAXGUSDT":
-                        df[['o','h','l','c']] -= 2.8
+                        df[['o', 'h', 'l', 'c']] -= 2.8
                     return df
         except Exception as e:
             logger.error(f"Klines {symbol}: {e}")
         return pd.DataFrame()
 
-# ---------------------------------------------------------------------------
-# Analysis with real order-flow conviction
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# Signal Data Class
+# ------------------------------------------------------------
 @dataclass
 class Signal:
     symbol: str
@@ -175,6 +180,9 @@ class Signal:
     notes: str
     df: pd.DataFrame
 
+# ------------------------------------------------------------
+# Analysis Engine
+# ------------------------------------------------------------
 class OrderFlowAnalyzer:
     @staticmethod
     def _rsi(close: pd.Series, period: int = 14) -> float:
@@ -184,26 +192,12 @@ class OrderFlowAnalyzer:
         rs = gain / loss
         return float(100 - (100 / (1 + rs.iloc[-1])))
 
-    @staticmethod
-    def analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signal]:
-        state = feed.states[symbol]
-        if state.last_price <= 0:
-            return None
-
-        # Pull multi-TF
-        df5 = asyncio.get_event_loop().run_until_complete(
-            feed.get_candles(symbol, "5m", 80)
-        ) if False else None  # will be awaited properly below
-
-        return None  # placeholder – real method is async
-
 async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signal]:
     state = feed.states[symbol]
-    if state.last_price <= 0 or (asyncio.get_event_loop().time() - state.last_update) > 30:
+    if state.last_price <= 0 or (asyncio.get_event_loop().time() - state.last_update) > 45:
         return None
 
     df5 = await feed.get_candles(symbol, "5m", 80)
-    df15 = await feed.get_candles(symbol, "15m", 50)
     df1h = await feed.get_candles(symbol, "1h", 40)
 
     if df5.empty or len(df5) < 30:
@@ -218,7 +212,7 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
     )
     atr = float(tr.rolling(14).mean().iloc[-1])
 
-    # Session
+    # Session (EAT)
     now = datetime.now(EAT)
     h = now.hour + now.minute / 60
     if 13 <= h < 17:
@@ -230,28 +224,25 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
     else:
         sess = "OFF-HOURS"
 
-    # RSI + EMA
+    # Indicators
     rsi = OrderFlowAnalyzer._rsi(df5['c'])
     ema9 = float(df5['c'].ewm(span=9).mean().iloc[-1])
     ema21 = float(df5['c'].ewm(span=21).mean().iloc[-1])
     ema9_1h = float(df1h['c'].ewm(span=9).mean().iloc[-1]) if not df1h.empty else price
     ema21_1h = float(df1h['c'].ewm(span=21).mean().iloc[-1]) if not df1h.empty else price
 
-    # Order-flow metrics
     cvd = state.cvd
     imb = state.imbalance
     large_delta = state.large_buy - state.large_sell
 
-    # Regime
     vol_mean = float(df5['v'].tail(20).mean())
     regime = "TRENDING" if abs(cvd) > vol_mean * 0.6 else "RANGING"
 
-    # ----- Conviction scoring (0-10) -----
+    # Conviction scoring
     score = 0
     bull = 0
     bear = 0
 
-    # 1. CVD strength
     if cvd > 0:
         bull += 1
         score += 2 if abs(cvd) > vol_mean * 0.4 else 1
@@ -259,7 +250,6 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
         bear += 1
         score += 2 if abs(cvd) > vol_mean * 0.4 else 1
 
-    # 2. Order book imbalance
     if imb > 0.58:
         bull += 1
         score += 2
@@ -267,7 +257,6 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
         bear += 1
         score += 2
 
-    # 3. Large trade aggression
     if large_delta > 2:
         bull += 1
         score += 1
@@ -275,7 +264,6 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
         bear += 1
         score += 1
 
-    # 4. EMA structure
     if ema9 > ema21:
         bull += 1
         score += 1
@@ -283,7 +271,6 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
         bear += 1
         score += 1
 
-    # 5. Higher TF
     if ema9_1h > ema21_1h:
         bull += 1
         score += 2
@@ -291,7 +278,6 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
         bear += 1
         score += 2
 
-    # 6. RSI extreme
     if rsi < 32:
         bull += 1
         score += 1
@@ -299,7 +285,6 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
         bear += 1
         score += 1
 
-    # 7. Session quality
     if sess in ("LONDON", "NY KILLZONE"):
         score += 1
 
@@ -321,8 +306,7 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
 
     day_bias = "BULLISH" if ema9_1h > ema21_1h else "BEARISH"
 
-    notes = (f"CVD {cvd:.1f} | Imb {imb:.2f} | LargeΔ {large_delta} | "
-             f"RSI {rsi:.0f} | {regime}")
+    notes = f"CVD {cvd:.1f} | Imb {imb:.2f} | LargeΔ {large_delta} | RSI {rsi:.0f} | {regime}"
 
     return Signal(
         symbol=symbol,
@@ -345,9 +329,9 @@ async def full_analyze(feed: LiveFeed, symbol: str, name: str) -> Optional[Signa
         df=df5
     )
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 # Chart & Voice
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
 def make_chart(sig: Signal, path: str):
     df = sig.df.tail(55).reset_index(drop=True)
     fig, ax = plt.subplots(figsize=(13, 7), facecolor='#0d1117')
@@ -367,8 +351,7 @@ def make_chart(sig: Signal, path: str):
     ax.axhline(sig.t1, color='#00e676', ls='--', lw=1.4, label=f'T1 {sig.t1:.2f}')
     ax.axhline(sig.t2, color='#69f0ae', ls=':', lw=1.2, label=f'T2 {sig.t2:.2f}')
 
-    title = (f"{sig.name} | ${sig.price:.2f} | {sig.direction} "
-             f"(Conviction {sig.conviction}/10) | {sig.session}")
+    title = f"{sig.name} | ${sig.price:.2f} | {sig.direction} (Conviction {sig.conviction}/10) | {sig.session}"
     ax.set_title(title, color='white', fontsize=12, weight='bold')
     ax.tick_params(colors='#8b949e')
     for s in ax.spines.values():
@@ -392,9 +375,9 @@ def make_voice(sig: Signal, path: str):
     )
     gTTS(text=text, lang='en', slow=False).save(path)
 
-# ---------------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# Telegram Alerts
+# ------------------------------------------------------------
 class Alerts:
     def __init__(self):
         self.base = f"https://api.telegram.org/bot{TOKEN}"
@@ -410,7 +393,7 @@ class Alerts:
                 async with session.post(f"{self.base}/sendPhoto", data=data, timeout=40):
                     pass
         except Exception as e:
-            logger.error(f"Photo: {e}")
+            logger.error(f"Photo send error: {e}")
 
     async def voice(self, path: str, session: aiohttp.ClientSession):
         try:
@@ -421,7 +404,7 @@ class Alerts:
                 async with session.post(f"{self.base}/sendVoice", data=data, timeout=40):
                     pass
         except Exception as e:
-            logger.error(f"Voice: {e}")
+            logger.error(f"Voice send error: {e}")
 
     async def text(self, msg: str, session: aiohttp.ClientSession):
         try:
@@ -429,11 +412,11 @@ class Alerts:
             async with session.post(f"{self.base}/sendMessage", json=payload, timeout=15):
                 pass
         except Exception as e:
-            logger.error(f"Text: {e}")
+            logger.error(f"Text send error: {e}")
 
-# ---------------------------------------------------------------------------
-# Main real-time loop
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------
+# Main Loop
+# ------------------------------------------------------------
 async def main_loop():
     feed = LiveFeed()
     await feed.start()
@@ -451,7 +434,6 @@ async def main_loop():
                 if not sig:
                     continue
 
-                # Soft reset CVD window so it stays recent
                 feed.states[symbol].reset_window()
 
                 logger.info(
