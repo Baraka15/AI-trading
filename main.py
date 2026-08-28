@@ -1,14 +1,12 @@
 import asyncio
 import os
-import json
 import logging
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 import numpy as np
 import pandas as pd
 import aiohttp
-from urllib.parse import quote
 import pytz
 from flask import Flask
 from threading import Thread
@@ -18,14 +16,14 @@ logging.basicConfig(
     format='%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("BraxAllTick")
+logger = logging.getLogger("BraxTwelve")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-ALLTICK_TOKEN = os.getenv("ALLTICK_TOKEN")
+TD_KEY = os.getenv("TWELVEDATA_API_KEY")
 
-if not TOKEN or not CHAT_ID or not ALLTICK_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN, TELEGRAM_CHAT_ID and ALLTICK_TOKEN must be set")
+if not TOKEN or not CHAT_ID or not TD_KEY:
+    raise ValueError("TELEGRAM_TOKEN, TELEGRAM_CHAT_ID and TWELVEDATA_API_KEY must be set")
 
 EAT = pytz.timezone("Africa/Nairobi")
 SIGNAL_INTERVAL = 900  # 15 minutes
@@ -34,95 +32,63 @@ app = Flask(__name__)
 
 @app.route("/")
 def health():
-    return "BRAX ALLTICK DESK - ONLINE", 200
+    return "BRAX TWELVEDATA DESK - ONLINE", 200
 
 # ------------------------------------------------------------
-# AllTick Data Engine
+# Twelve Data Feed
 # ------------------------------------------------------------
-class AllTickFeed:
+class TwelveDataFeed:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
-        self.base = "https://quote.alltick.co/quote-b-api"
+        self.base = "https://api.twelvedata.com"
 
     async def start(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
 
-    async def get_price(self, code: str) -> float:
-        """Get latest trade price"""
-        query = {
-            "trace": f"price-{datetime.now().timestamp()}",
-            "data": {
-                "symbol_list": [{"code": code}]
-            }
-        }
-        q = quote(json.dumps(query))
-        url = f"{self.base}/trade-tick?token={ALLTICK_TOKEN}&query={q}"
-
+    async def get_quote(self, symbol: str) -> float:
+        url = f"{self.base}/quote?symbol={symbol}&apikey={TD_KEY}"
         try:
             async with self.session.get(url) as r:
                 data = await r.json()
-                logger.info(f"AllTick price response ({code}): {str(data)[:300]}")
-
-                # Different possible response structures
-                if "data" in data:
-                    d = data["data"]
-                    if isinstance(d, list) and len(d) > 0:
-                        item = d[0]
-                        if "price" in item:
-                            return float(item["price"])
-                        if "tick_list" in item and item["tick_list"]:
-                            return float(item["tick_list"][0].get("price", 0))
-                    if isinstance(d, dict):
-                        if "price" in d:
-                            return float(d["price"])
-                        if "tick_list" in d and d["tick_list"]:
-                            return float(d["tick_list"][0].get("price", 0))
+                if data.get("status") == "error":
+                    logger.warning(f"TwelveData quote error {symbol}: {data.get('message')}")
+                    return 0.0
+                price = data.get("close") or data.get("price")
+                return float(price) if price else 0.0
         except Exception as e:
-            logger.error(f"AllTick price error {code}: {e}")
-        return 0.0
+            logger.error(f"Quote {symbol}: {e}")
+            return 0.0
 
-    async def get_candles(self, code: str, kline_type: int = 2, limit: int = 80) -> pd.DataFrame:
-        """
-        kline_type:
-        1 = 1min, 2 = 5min, 3 = 15min, 5 = 1h, 8 = 1day
-        """
-        query = {
-            "trace": f"kline-{datetime.now().timestamp()}",
-            "data": {
-                "code": code,
-                "kline_type": kline_type,
-                "kline_timestamp_end": 0,
-                "query_kline_num": limit,
-                "adjust_type": 0
-            }
-        }
-        q = quote(json.dumps(query))
-        url = f"{self.base}/kline?token={ALLTICK_TOKEN}&query={q}"
-
+    async def get_candles(self, symbol: str, interval: str = "5min", outputsize: int = 80) -> pd.DataFrame:
+        url = (
+            f"{self.base}/time_series"
+            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TD_KEY}"
+        )
         try:
             async with self.session.get(url) as r:
                 data = await r.json()
-                logger.info(f"AllTick kline response ({code}): {str(data)[:400]}")
+                if data.get("status") == "error":
+                    logger.warning(f"TwelveData candles error {symbol}: {data.get('message')}")
+                    return pd.DataFrame()
+                if "values" not in data:
+                    return pd.DataFrame()
 
-                if "data" in data and "kline_list" in data["data"]:
-                    klines = data["data"]["kline_list"]
-                    records = []
-                    for k in klines:
-                        records.append({
-                            "o": float(k.get("open", 0)),
-                            "h": float(k.get("high", 0)),
-                            "l": float(k.get("low", 0)),
-                            "c": float(k.get("close", 0)),
-                            "v": float(k.get("volume", 0))
-                        })
-                    df = pd.DataFrame(records)
-                    if not df.empty:
-                        # AllTick usually returns newest first → reverse
-                        df = df.iloc[::-1].reset_index(drop=True)
-                    return df
+                df = pd.DataFrame(data["values"])
+                df = df.rename(columns={
+                    "open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"
+                })
+                for col in ["o", "h", "l", "c"]:
+                    df[col] = df[col].astype(float)
+                if "v" in df.columns:
+                    df["v"] = df["v"].astype(float)
+                else:
+                    df["v"] = 0.0
+                # Twelve Data returns newest first → reverse to oldest first
+                df = df.iloc[::-1].reset_index(drop=True)
+                return df
         except Exception as e:
-            logger.error(f"AllTick kline error {code}: {e}")
-        return pd.DataFrame()
+            logger.error(f"Candles {symbol}: {e}")
+            return pd.DataFrame()
 
 # ------------------------------------------------------------
 # Analysis
@@ -156,9 +122,9 @@ def calc_rsi(series: pd.Series, period: int = 14) -> float:
     val = 100 - (100 / (1 + rs.iloc[-1]))
     return float(val) if not np.isnan(val) else 50.0
 
-async def analyze(feed: AllTickFeed, code: str, name: str) -> Signal:
-    price = await feed.get_price(code)
-    df = await feed.get_candles(code, kline_type=2, limit=80)  # 5min
+async def analyze(feed: TwelveDataFeed, symbol: str, name: str) -> Signal:
+    price = await feed.get_quote(symbol)
+    df = await feed.get_candles(symbol, "5min", 90)
 
     now = datetime.now(EAT)
     h = now.hour + now.minute / 60
@@ -171,10 +137,10 @@ async def analyze(feed: AllTickFeed, code: str, name: str) -> Signal:
     else:
         sess = "OFF-HOURS"
 
-    if price <= 0 or df.empty or len(df) < 15:
+    if price <= 0 or df.empty or len(df) < 20:
         return Signal(
             name=name, price=price, direction="NEUTRAL", conviction=1,
-            session=sess, regime="NO DATA FROM ALLTICK", cvd=0.0,
+            session=sess, regime="NO DATA", cvd=0.0,
             entry=price, sl=price, t1=price, t2=price,
             day_bias="NEUTRAL", atr=0.0, rsi=50.0,
             ema9=price, ema21=price, change_pct=0.0, df=df
@@ -197,7 +163,7 @@ async def analyze(feed: AllTickFeed, code: str, name: str) -> Signal:
     cvd = float(df["buy_vol"].tail(12).sum() - df["sell_vol"].tail(12).sum())
 
     vol_mean = float(df["v"].tail(20).mean()) or 1.0
-    regime = "TRENDING" if abs(cvd) > vol_mean * 0.5 else "RANGING / COMPRESSING"
+    regime = "TRENDING" if abs(cvd) > vol_mean * 0.55 else "RANGING / COMPRESSING"
 
     # Scoring
     score = 0
@@ -205,10 +171,10 @@ async def analyze(feed: AllTickFeed, code: str, name: str) -> Signal:
 
     if cvd > 0:
         bull += 1
-        score += 2 if abs(cvd) > vol_mean * 0.3 else 1
+        score += 2 if abs(cvd) > vol_mean * 0.35 else 1
     else:
         bear += 1
-        score += 2 if abs(cvd) > vol_mean * 0.3 else 1
+        score += 2 if abs(cvd) > vol_mean * 0.35 else 1
 
     if ema9 > ema21:
         bull += 1
@@ -275,7 +241,7 @@ def make_recap(sig: Signal) -> str:
 
     return f"""
 <b>BRAX INSTITUTIONAL DESK — {sig.name}</b>
-<code>{time_str} | {sig.session} | Source: AllTick</code>
+<code>{time_str} | {sig.session} | Source: Twelve Data</code>
 
 <b>Price:</b> ${sig.price:.2f}  ({sig.change_pct:+.2f}%)
 <b>Day Bias:</b> {sig.day_bias}
@@ -316,49 +282,47 @@ class Alerts:
             logger.error(f"Telegram error: {e}")
 
 async def main_loop():
-    feed = AllTickFeed()
+    feed = TwelveDataFeed()
     await feed.start()
     alerts = Alerts()
 
     await alerts.text(
-        "<b>BRAX ALLTICK DESK ONLINE</b>\n"
-        "Using AllTick as primary data source.\n"
+        "<b>BRAX TWELVEDATA DESK ONLINE</b>\n"
+        "Using real XAU/USD + BTC/USD from Twelve Data.\n"
         "First recaps in \~25 seconds...",
         feed.session
     )
 
     assets = [
-        ("XAUUSD", "GOLD"),
-        ("BTCUSDT", "BITCOIN"),
+        ("XAU/USD", "GOLD"),
+        ("BTC/USD", "BITCOIN"),
     ]
 
     await asyncio.sleep(25)
 
-    await alerts.text("<b>Sending first AllTick recaps now...</b>", feed.session)
+    await alerts.text("<b>Sending first Twelve Data recaps...</b>", feed.session)
 
-    for code, name in assets:
+    for symbol, name in assets:
         try:
-            sig = await analyze(feed, code, name)
+            sig = await analyze(feed, symbol, name)
             await alerts.text(make_recap(sig), feed.session)
-            logger.info(f"First recap → {name} | ${sig.price:.2f}")
+            logger.info(f"First → {name} | ${sig.price:.2f}")
         except Exception as e:
-            logger.error(f"First cycle {name}: {e}")
-            await alerts.text(f"<b>{name}</b>\nError: {str(e)[:180]}", feed.session)
+            logger.error(f"First {name}: {e}")
+            await alerts.text(f"<b>{name}</b>\nError: {str(e)[:160]}", feed.session)
 
-    # Normal 15-minute loop
     while True:
         try:
             await asyncio.sleep(SIGNAL_INTERVAL)
-            for code, name in assets:
+            for symbol, name in assets:
                 try:
-                    sig = await analyze(feed, code, name)
+                    sig = await analyze(feed, symbol, name)
                     await alerts.text(make_recap(sig), feed.session)
-                    logger.info(f"Recap → {name} | {sig.direction} | Conv {sig.conviction}")
+                    logger.info(f"Recap → {name} | {sig.direction} | {sig.conviction}/10")
                 except Exception as e:
                     logger.error(f"Cycle {name}: {e}")
-                    await alerts.text(f"<b>{name}</b>\nTemporary error: {str(e)[:120]}", feed.session)
         except Exception as e:
-            logger.error(f"Main loop error: {e}")
+            logger.error(f"Main loop: {e}")
             await asyncio.sleep(20)
 
 def run_flask():
