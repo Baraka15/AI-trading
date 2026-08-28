@@ -1,6 +1,4 @@
-The deployment failed because the Markdown code block backticks (```python at the top and ``` at the bottom) were copied into **main.py**. Python cannot execute Markdown formatting tags.
-To fix this, open **main.py** and delete ```python on line 1 and ``` on the final line, or replace the entire file content with the raw code below:
-```python
+
 import asyncio
 import os
 import time
@@ -241,5 +239,3 @@ def run_flask():
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
     asyncio.run(live_execution_loop())
-
-```
