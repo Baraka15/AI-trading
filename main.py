@@ -1,17 +1,20 @@
 """
-BRAX SMART DESK v2 — Real-time multi-asset analysis engine
+BRAX SMART DESK v3 — Real-time multi-asset analysis engine
 ===========================================================
-Data spine:  Binance WebSocket (BTC, PAXG)  +  TwelveData poll (XAU/USD)  +  goldprice.org backup
-Modules:     Multi-horizon trends • Session macro • Premium/Discount • Liquidity map (BSL/SSL + sweeps)
-             CVD order flow • BOS/FVG structure • Volatility engine • Regime detection • Confluence swarm
-             T1/T2/SL tracker • Self-auditing prediction ledger • Correlation engine
-             Autonomous day outlook • Voice briefings • TradingView-style charts
+Data spine:  Binance WS + REST bootstrap/fallback (BTC, PAXG — 24/7)
+             TwelveData 1min (XAU/USD) + goldprice.org backup
+             XAU spot-hours awareness (closed Fri 22:00 UTC → Sun 22:00 UTC)
+             PAXG = live 24/7 tokenized-gold proxy desk
+Modules:     Multi-horizon trends • Session macro • Premium/Discount • Liquidity map
+             CVD order flow • BOS/FVG structure • Volatility engine • Regime detection
+             Confluence swarm • T1/T2/SL tracker • Self-auditing ledger • Correlation
+             Autonomous day outlook • Voice briefings • Charts w/ volume • Market-school
 Deploy:      Render → Start Command: python main.py
-Env vars:    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TWELVEDATA_API_KEY (RENDER_EXTERNAL_URL is auto-set)
+Env vars:    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TWELVEDATA_API_KEY
 """
 import asyncio, os, json, time, random, logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import aiohttp
@@ -29,14 +32,22 @@ logging.basicConfig(level=logging.INFO,
     datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger("BRAX")
 
-TOKEN     = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-TD_KEY    = os.getenv("TWELVEDATA_API_KEY")
-SELF_URL  = os.getenv("RENDER_EXTERNAL_URL", "")   # keeps Render free tier awake
+TOKEN   = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TD_KEY  = os.getenv("TWELVEDATA_API_KEY")
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
-DESK_INTERVAL = 15 * 60   # full desk update cadence (seconds)
-TICK_INTERVAL = 30        # live engine tick (seconds)
-GOLD_POLL     = 120       # TwelveData poll (seconds — fits free tier)
+BINANCE_REST  = "https://data-api.binance.vision/api/v3"
+BINANCE_HOSTS = ["wss://data-stream.binance.vision/stream?streams=",
+                 "wss://stream.binance.com:9443/stream?streams="]
+
+DESK_INTERVAL  = 15 * 60
+TICK_INTERVAL  = 30
+GOLD_POLL      = 120
+GOLD_POLL_CLOSED = 900       # poll slowly while spot gold is shut
+GOLD_STATUS_INTERVAL = 2 * 3600
+STALE_CRYPTO_SEC = 90        # WS silent this long → REST fallback
+STALE_FEED_SEC   = 300       # candle this old → feed considered stale
 EAT = pytz.timezone("Africa/Nairobi")
 
 for v in (TOKEN, CHAT_ID, TD_KEY):
@@ -51,6 +62,40 @@ def session_now() -> tuple[str, bool]:
     if 8 <= h < 13:    return "LONDON", h < 10
     if 2 <= h < 8:     return "ASIAN", False
     return "OFF-HOURS", False
+
+# ---------------------------------------------------------------- XAU MARKET HOURS
+def gold_market_open() -> bool:
+    now = datetime.now(pytz.utc)
+    wd, m = now.weekday(), now.hour * 60 + now.minute
+    if wd == 5:                                   return False   # Saturday
+    if wd == 6 and m < 22 * 60 + 1:               return False   # Sunday pre-open
+    if wd == 4 and m >= 22 * 60:                  return False   # Friday post-close
+    if wd in (0, 1, 2, 3) and 21 * 60 <= m < 22 * 60: return False  # daily break
+    return True
+
+def gold_next_open_eat() -> datetime:
+    now = datetime.now(pytz.utc)
+    days = (6 - now.weekday()) % 7                # next Sunday
+    if days == 0 and now.hour * 60 + now.minute >= 22 * 60:
+        days = 7
+    t = (now + timedelta(days=days)).replace(hour=22, minute=0, second=0, microsecond=0)
+    return t.astimezone(EAT)
+
+# ---------------------------------------------------------------- MARKET SCHOOL
+LESSONS = [
+    "Stops cluster above old highs and below old lows. Big players push price into those pools to fill size — that is why breakouts often fail seconds after a sweep. Trade the reaction to the sweep, not the sweep itself.",
+    "Most real directional moves are born in the London open (08:00-10:00 EAT) and the NY killzone (13:00-17:00 EAT). Mid-session breakouts are usually traps designed to harvest late entries.",
+    "Never buy in premium and never sell in discount of the dealing range. Institutions accumulate at wholesale (discount) and distribute at retail (premium). Your entries should follow the same logic.",
+    "When price prints new highs but CVD falls, buyers are exhausted and the move is being distributed into strength. Price leads, flow confirms — when they disagree, the flow usually wins.",
+    "XAU/USD spot shuts Friday 22:00 UTC until Sunday 22:00 UTC. Weekend 'gold moves' come from stale quotes, not a live market. PAXG, the tokenized gold on Binance, trades 24/7 and tracks spot within a few dollars.",
+    "Around CPI, NFP and FOMC, spreads widen 5-10x and both sides get wicked before the real move. Professionals wait 15 minutes after the print, then trade the confirmed direction, not the spike.",
+    "ATR tells you what regime you are in. CONTRACTING volatility breeds fake breakouts and mean reversion. EXPANDING volatility favors continuation. Size stops by ATR, never by fixed distances.",
+    "When Gold and BTC correlation spikes above 0.6 during dollar-liquidity events, a flush in one drags the other. Do not hedge one with the other blindly — you would be doubling risk, not hedging.",
+    "The last opposing candle before an impulsive BOS marks institutional entry — the order block. Its first retest after the break is one of the highest-probability entries in price action.",
+    "The first 15 minutes of London frequently sweeps the Asian range high or low — the judas swing — before the true daily direction reveals itself. The sweep is the bait; the reaction is the trade.",
+]
+def market_lesson() -> str:
+    return LESSONS[int(time.time() // 3600) % len(LESSONS)]
 
 # ---------------------------------------------------------------- INDICATORS
 def rsi(close: pd.Series, n=14) -> float:
@@ -111,42 +156,52 @@ def psych_level(price, name):
     step = 1000 if "BTC" in name else (5 if "GOLD" in name else 1)
     return round(price / step) * step
 
-def fp(x, name):  # format price
+def fp(x, name):
     return f"${x:,.0f}" if "BTC" in name else f"${x:,.2f}"
 
 # ---------------------------------------------------------------- CANDLE STORE
 class CandleStore:
     def __init__(self, name, ws_sym=None):
         self.name, self.ws_sym = name, ws_sym
-        self._c = {}                        # minute_epoch -> [o,h,l,c,v]
+        self._c = {}
         self._df, self._df_ts = None, 0.0
         self.price, self.day_open = 0.0, None
-        self.cvd_ticks = deque(maxlen=20000)  # (ts, signed_vol)
-        self.last20 = deque(maxlen=20)        # True = bull print
+        self.cvd_ticks = deque(maxlen=20000)
+        self.last20 = deque(maxlen=20)
         self.last_update = 0.0
+        self.source = "—"              # live label of the feeding source
 
-    def ingest_kline(self, k: dict):
-        t = int(k["t"]) // 60000
-        o, h, l, c, v = (float(k["o"]), float(k["h"]), float(k["l"]),
-                         float(k["c"]), float(k["v"]))
-        self._c[t] = [o, h, l, c, v]
-        self.price = c
-        self.last_update = time.time()
-        self._trim(); self._df = None
+    def _update_day_open(self):
         utc_today = datetime.now(pytz.utc).replace(
             hour=0, minute=0, second=0, microsecond=0).timestamp() // 60
         todays = [cd[0] for tt, cd in self._c.items() if tt >= utc_today]
         if todays: self.day_open = todays[0]
 
+    def ingest_kline(self, k: dict):
+        t = int(k["t"]) // 60000
+        self._c[t] = [float(k["o"]), float(k["h"]), float(k["l"]),
+                      float(k["c"]), float(k["v"])]
+        self.price = float(k["c"])
+        self.last_update = time.time()
+        self._trim(); self._df = None
+        self._update_day_open()
+
+    def ingest_kline_tuple(self, t_min, o, h, l, c, v):
+        self._c[int(t_min)] = [o, h, l, c, v]
+        self.price = c
+        self.last_update = time.time()
+        self._trim(); self._df = None
+        self._update_day_open()
+
     def ingest_trade(self, t: dict):
         p, q = float(t["p"]), float(t["q"])
-        bull = not t["m"]                    # maker=True => sell aggressor
+        bull = not t["m"]
         self.cvd_ticks.append((t["T"] / 1000, q if bull else -q))
         self.last20.append(bull)
         self.price = p; self.last_update = time.time()
         self._df = None
 
-    def ingest_td(self, values: list):       # TwelveData 1min, newest-first
+    def ingest_td(self, values: list):
         for r in values:
             try:
                 ts = int(datetime.strptime(r["datetime"], "%Y-%m-%d %H:%M:%S")
@@ -156,12 +211,18 @@ class CandleStore:
                                float(r.get("volume") or 0)]
             except Exception:
                 continue
-        self.price = float(values[0]["close"])
+        if values:
+            self.price = float(values[0]["close"])
         self.last_update = time.time(); self._df = None
+        self._update_day_open()
 
     def _trim(self):
         cutoff = time.time() - 3 * 86400
         for k in [k for k in self._c if k < cutoff]: del self._c[k]
+
+    def data_age(self) -> float:
+        if not self._c: return 1e9
+        return time.time() - max(self._c) * 60
 
     def df(self, rule="1min", bars=None) -> pd.DataFrame:
         if not self._c: return pd.DataFrame()
@@ -182,9 +243,6 @@ class CandleStore:
         return sum(v for ts, v in self.cvd_ticks if ts >= cut)
 
 # ---------------------------------------------------------------- FEEDS
-BINANCE_HOSTS = ["wss://data-stream.binance.vision/stream?streams=",
-                 "wss://stream.binance.com:9443/stream?streams="]
-
 async def binance_worker(stores: list[CandleStore]):
     streams = []
     for s in stores:
@@ -200,6 +258,8 @@ async def binance_worker(stores: list[CandleStore]):
                 async with ses.ws_connect(url, heartbeat=25) as ws:
                     log.info(f"WS connected: {host}")
                     backoff = 5
+                    for s in stores:
+                        if s.ws_sym: s.source = "BINANCE WS"
                     async for msg in ws:
                         if msg.type != aiohttp.WSMsgType.TEXT: continue
                         d = json.loads(msg.data).get("data", {})
@@ -215,6 +275,66 @@ async def binance_worker(stores: list[CandleStore]):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
 
+async def crypto_rest_fallback(stores: list[CandleStore], ses: aiohttp.ClientSession):
+    """If the WS is silent (geo-block, network), keep prices real via REST."""
+    while True:
+        await asyncio.sleep(30)
+        for st in stores:
+            if not st.ws_sym: continue
+            if time.time() - st.last_update < STALE_CRYPTO_SEC: continue
+            sym = st.ws_sym.upper()
+            try:
+                log.warning(f"{st.name}: feed silent {int(time.time()-st.last_update)}s → REST fallback")
+                async with ses.get(f"{BINANCE_REST}/klines?symbol={sym}&interval=1m&limit=3") as r:
+                    kl = await r.json()
+                if isinstance(kl, list) and kl:
+                    for k in kl:
+                        st.ingest_kline_tuple(int(k[0]) // 60000, float(k[1]), float(k[2]),
+                                              float(k[3]), float(k[4]), float(k[5]))
+                    st.source = "BINANCE REST (WS blocked)"
+                    log.info(f"{st.name}: REST fallback OK @ {st.price}")
+            except Exception as e:
+                log.error(f"REST fallback {st.name}: {e}")
+
+async def bootstrap_crypto(stores: list[CandleStore], ses: aiohttp.ClientSession):
+    """Seed 1000×1m bars + last 1000 aggTrades so analysis is live within seconds of boot."""
+    for st in stores:
+        if not st.ws_sym: continue
+        sym = st.ws_sym.upper()
+        try:
+            async with ses.get(f"{BINANCE_REST}/klines?symbol={sym}&interval=1m&limit=1000") as r:
+                kl = await r.json()
+            if isinstance(kl, list) and kl:
+                for k in kl:
+                    st._c[int(k[0]) // 60000] = [float(k[1]), float(k[2]),
+                                                 float(k[3]), float(k[4]), float(k[5])]
+                st.price = float(kl[-1][4]); st.last_update = time.time(); st._df = None
+                st._update_day_open()
+                log.info(f"{st.name}: bootstrapped {len(kl)} 1m bars (REST)")
+        except Exception as e:
+            log.error(f"bootstrap klines {st.name}: {e}")
+        try:
+            async with ses.get(f"{BINANCE_REST}/aggTrades?symbol={sym}&limit=1000") as r:
+                tr = await r.json()
+            if isinstance(tr, list):
+                for t in tr:
+                    st.ingest_trade({"p": t["p"], "q": t["q"], "m": t["m"], "T": t["T"]})
+                log.info(f"{st.name}: CVD seeded with {len(tr)} trades")
+        except Exception as e:
+            log.error(f"bootstrap aggTrades {st.name}: {e}")
+
+async def bootstrap_gold(gold: CandleStore, ses: aiohttp.ClientSession):
+    try:
+        async with ses.get(f"https://api.twelvedata.com/time_series"
+                           f"?symbol=XAU/USD&interval=1min&outputsize=500&apikey={TD_KEY}") as r:
+            d = await r.json()
+        if d.get("values"):
+            gold.ingest_td(d["values"])
+            gold.source = "TWELVEDATA"
+            log.info(f"GOLD bootstrapped {len(d['values'])} bars @ ${gold.price:.2f}")
+    except Exception as e:
+        log.error(f"bootstrap gold: {e}")
+
 async def gold_worker(gold: CandleStore, ses: aiohttp.ClientSession):
     while True:
         try:
@@ -223,21 +343,27 @@ async def gold_worker(gold: CandleStore, ses: aiohttp.ClientSession):
                 d = await r.json()
             if d.get("values"):
                 gold.ingest_td(d["values"])
+                gold.source = "TWELVEDATA"
                 log.info(f"GOLD synced ${gold.price:.2f}")
             else:
                 async with ses.get("https://data-asg.goldprice.org/dbXRates/USD") as r2:
                     gp = (await r2.json())["items"][0]["xauPrice"]
                 if gold.price <= 0 or abs(gp - gold.price) > 0.5:
                     gold.price = float(gp); gold.last_update = time.time()
+                gold.source = "GOLDPRICE.ORG"
                 log.info(f"GOLD via goldprice.org ${gp:.2f}")
         except Exception as e:
             log.error(f"Gold feed: {e}")
-        await asyncio.sleep(GOLD_POLL)
+        await asyncio.sleep(GOLD_POLL if gold_market_open() else GOLD_POLL_CLOSED)
 
 # ---------------------------------------------------------------- ANALYSIS ENGINE
 def analyze(store: CandleStore, proxy: CandleStore | None = None,
-            corr: float = 0.0) -> dict:
+            corr: float = 0.0, market_open: bool = True) -> dict:
     A = {"store": store, "name": store.name, "price": store.price, "full": False}
+    A["source"] = store.source
+    A["age"] = store.data_age()
+    A["live"] = market_open and A["age"] < (180 if store.ws_sym else STALE_FEED_SEC)
+    A["market_open"] = market_open
     df15 = store.df("15min", 96)
     if len(df15) < 20: return A
     A["full"] = True
@@ -251,9 +377,8 @@ def analyze(store: CandleStore, proxy: CandleStore | None = None,
     A["adx"] = adx_v
     A["regime"] = ("TRENDING" if adx_v >= 25 else
                    "RANGING" if adx_v >= 20 else "CHOPPY")
-    A["tradeable"] = adx_v >= 22
+    A["tradeable"] = adx_v >= 22 and A["live"]
 
-    # multi-horizon trends
     trends, bull_n = {}, 0
     for tf, rule in (("H1", "1h"), ("M15", "15min"), ("M5", "5min"), ("M1", "1min")):
         d = store.df(rule, 120)
@@ -268,20 +393,17 @@ def analyze(store: CandleStore, proxy: CandleStore | None = None,
     A["align"] = "BULL" if bull_n >= 3 else "BEAR" if bull_n <= -3 else "MIXED"
     A["strength"] = min(3, abs(bull_n))
 
-    # structure
     bos, sh, sl = detect_bos(df15)
     fvg, fvg_t, fvg_lv = detect_fvg(df15, a)
     A["bos"], A["sh"], A["sl"] = bos, sh, sl
     A["fvg"], A["fvg_t"], A["fvg_lv"] = fvg, fvg_t, fvg_lv
 
-    # premium / discount (24h range)
     hi, lo = float(df15.h.max()), float(df15.l.min())
     eq = (hi + lo) / 2
     A.update(prem=hi - 0.25 * (hi - lo), disc=lo + 0.25 * (hi - lo), eq=eq,
              zpos=("PREMIUM" if A["price"] > eq + 0.1 * (hi - lo) else
                    "DISCOUNT" if A["price"] < eq - 0.1 * (hi - lo) else "EQUILIBRIUM"))
 
-    # liquidity map: swing levels above/below price + psych level
     sh_p = sorted({p for _, p in swings(df15, 3)[0] if p > A["price"]})
     sl_p = sorted({p for _, p in swings(df15, 3)[1] if p < A["price"]}, reverse=True)
     psy = psych_level(A["price"], A["name"])
@@ -290,7 +412,6 @@ def analyze(store: CandleStore, proxy: CandleStore | None = None,
     A["bsl"], A["bsl2"] = (sh_p[0], sh_p[1]) if len(sh_p) > 1 else (sh_p[0] if sh_p else hi, None)
     A["ssl"], A["ssl2"] = (sl_p[0], sl_p[1]) if len(sl_p) > 1 else (sl_p[0] if sl_p else lo, None)
 
-    # sweep detection (last closed 5m candle)
     d5 = store.df("5min", 6)
     A["sweep_bsl"] = A["sweep_ssl"] = False
     if len(d5) >= 2:
@@ -298,7 +419,6 @@ def analyze(store: CandleStore, proxy: CandleStore | None = None,
         if A["bsl"] and lc.h > A["bsl"] and lc.c < A["bsl"]: A["sweep_bsl"] = True
         if A["ssl"] and lc.l < A["ssl"] and lc.c > A["ssl"]: A["sweep_ssl"] = True
 
-    # order flow (PAXG as proxy for GOLD)
     flow_store = store if store.cvd_ticks else proxy
     if flow_store and flow_store.cvd_ticks:
         cvd_now = flow_store.cvd(1800)
@@ -307,8 +427,8 @@ def analyze(store: CandleStore, proxy: CandleStore | None = None,
         px = flow_store.price
         d5f = flow_store.df("5min", 8)
         px_ago = float(d5f.c.iloc[0]) if len(d5f) else px
-        A["bull_div"] = px > px_ago and cvd_now < cvd_ago     # price up, flow down
-        A["bear_div"] = px < px_ago and cvd_now > cvd_ago     # price down, flow up
+        A["bull_div"] = px > px_ago and cvd_now < cvd_ago
+        A["bear_div"] = px < px_ago and cvd_now > cvd_ago
         A["cvd"] = cvd_now
         bulls = sum(1 for b in flow_store.last20 if b)
         A["bull_n"], A["bear_n"] = bulls, 20 - bulls
@@ -325,20 +445,23 @@ def analyze(store: CandleStore, proxy: CandleStore | None = None,
     A["day_open"] = store.day_open or A["price"]
     return A
 
-# ---------------------------------------------------------------- CONFLUENCE SWARM (4 voters)
+# ---------------------------------------------------------------- CONFLUENCE SWARM
 def swarm(A: dict):
     trend_v = "BUY" if A["align"] == "BULL" else "SELL" if A["align"] == "BEAR" else "WAIT"
     struct_v = ("BUY" if (A["bos"] == "UP" or (A["fvg"] and A["fvg_t"] == "BULLISH"))
                 else "SELL" if (A["bos"] == "DOWN" or (A["fvg"] and A["fvg_t"] == "BEARISH"))
                 else "WAIT")
-    if A.get("bull_div"):   flow_v = "BUY"    # price low, buyers absorbing
-    elif A.get("bear_div"): flow_v = "SELL"   # price high, sellers absorbing
+    if A.get("bull_div"):   flow_v = "BUY"
+    elif A.get("bear_div"): flow_v = "SELL"
     elif A.get("cvd", 0) > 0: flow_v = "BUY"
     elif A.get("cvd", 0) < 0: flow_v = "SELL"
     else: flow_v = "WAIT"
     zone_v = ("BUY" if A["sweep_ssl"] or A["zpos"] == "DISCOUNT"
               else "SELL" if A["sweep_bsl"] or A["zpos"] == "PREMIUM" else "WAIT")
     votes = {"TREND": trend_v, "STRUCT": struct_v, "FLOW": flow_v, "ZONE": zone_v}
+    # HARD GATE: never fire on stale/closed data — this killed the fake weekend gold signals
+    if not A.get("live", True):
+        return "WAIT", 0, votes
     buys, sells = sum(1 for v in votes.values() if v == "BUY"), sum(1 for v in votes.values() if v == "SELL")
     if buys >= 3 and sells == 0:   d, conf = "BUY", buys / 4 * 100
     elif sells >= 3 and buys == 0: d, conf = "SELL", sells / 4 * 100
@@ -355,12 +478,12 @@ def build_levels(A, d):
         entry = p - 0.1 * a
         sl = min(A["ssl"] or entry - 1.3 * a, entry - 0.8 * a) - 0.25 * a
         t1 = A["bsl"] or entry + 1.5 * a
-        t2 = A["bsl2"] or entry + 3 * a
+        t2 = A["bsl2"] or max(entry + 3 * a, t1 + 1.2 * a)   # never equal to T1
     elif d == "SELL":
         entry = p + 0.1 * a
         sl = max(A["bsl"] or entry + 1.3 * a, entry + 0.8 * a) + 0.25 * a
         t1 = A["ssl"] or entry - 1.5 * a
-        t2 = A["ssl2"] or entry - 3 * a
+        t2 = A["ssl2"] or min(entry - 3 * a, t1 - 1.2 * a)   # never equal to T1
     else:
         entry = sl = t1 = t2 = p
     return entry, sl, t1, t2
@@ -370,7 +493,8 @@ def narrative(A: dict, d, conf, votes, audit_str: str) -> str:
     e, sl, t1, t2 = build_levels(A, d)
     sgn = "BULLISH" if d == "BUY" else "BEARISH" if d == "SELL" else "NEUTRAL"
     L = [f"<b>WHAT {n} WILL DO NEXT — LIVE ENGINE</b>",
-         f"<code>{now_eat().strftime('%H:%M EAT')} | {A['sess']}{' ⚡KILLZONE' if A['killzone'] else ''}</code>", ""]
+         f"<code>{now_eat().strftime('%H:%M EAT')} | {A['sess']}{' ⚡KILLZONE' if A['killzone'] else ''} | "
+         f"FEED: {A['source']} ({int(A['age'])}s old)</code>", ""]
     L.append("<b>SHORT TERM (next 1–3h):</b>")
     if d == "BUY":
         L.append(f"- <b>{sgn}</b> — holding {fp(A['disc'], n)} discount zone, structure {A['bos']}")
@@ -411,10 +535,11 @@ def narrative(A: dict, d, conf, votes, audit_str: str) -> str:
     L.append(f"<b>DESK:</b> {d} — voters {votes['TREND']}/{votes['STRUCT']}/{votes['FLOW']}/{votes['ZONE']} — conf <b>{conf}%</b>")
     if d != "WAIT":
         L.append(f"Entry {fp(e, n)} | SL {fp(sl, n)} | T1 {fp(t1, n)} | T2 {fp(t2, n)}")
+    L.append(f"\n🎓 <b>MARKET SECRET:</b> {market_lesson()}")
     L.append(f"<code>{audit_str} • analysis, not financial advice • live {TICK_INTERVAL}s tick</code>")
     return "\n".join(L)
 
-# ---------------------------------------------------------------- PREDICTION LEDGER (self-audit)
+# ---------------------------------------------------------------- PREDICTION LEDGER
 class Ledger:
     def __init__(self):
         self.open, self.results = [], deque(maxlen=200)
@@ -444,9 +569,9 @@ class Ledger:
         return (f"SELF-AUDIT: {sum(recent)}/{len(recent)} predictions correct "
                 f"({sum(recent)/len(recent)*100:.0f}%)")
 
-# ---------------------------------------------------------------- ACTIVE SIGNAL TRACKER
+# ---------------------------------------------------------------- TRACKER
 class Tracker:
-    def __init__(self): self.active = {}   # name -> state dict
+    def __init__(self): self.active = {}
 
     def arm(self, A, d, conf, entry, sl, t1, t2):
         self.active[A["name"]] = {"d": d, "conf": conf, "entry": entry, "sl": sl,
@@ -455,7 +580,7 @@ class Tracker:
 
     def check(self, A) -> list[str]:
         s = self.active.get(A["name"]); out = []
-        if not s or not A["full"]: return out
+        if not s or not A["full"] or not A.get("live", True): return out
         p, n = A["price"], A["name"]
         if s["d"] == "BUY":
             hit, run, stop = p >= s["t1"], p >= s["t2"], p <= s["sl"]
@@ -473,16 +598,21 @@ class Tracker:
             self.active.pop(n, None)
         return out
 
-# ---------------------------------------------------------------- CHART
+# ---------------------------------------------------------------- CHART (candles + volume)
 def make_chart(A, d, entry, sl, t1, t2, path):
     df = A["store"].df("15min", 80)
-    fig, ax = plt.subplots(figsize=(11, 6), dpi=100)
-    fig.patch.set_facecolor("#131722"); ax.set_facecolor("#131722")
+    fig, (ax, axv) = plt.subplots(2, 1, figsize=(11, 7), dpi=100, sharex=True,
+                                  gridspec_kw={"height_ratios": [4, 1]})
+    fig.patch.set_facecolor("#131722")
+    for a_ in (ax, axv): a_.set_facecolor("#131722")
     up, dn = "#26a69a", "#ef5350"
+    vols = df.v.replace(0, np.nan)
     for i, (_, r) in enumerate(df.iterrows()):
         c = up if r.c >= r.o else dn
         ax.vlines(i, r.l, r.h, color=c, lw=1)
         ax.bar(i, r.c - r.o, bottom=r.o, width=0.6, color=c, edgecolor=c, zorder=3)
+        axv.bar(i, r.v if pd.notna(r.v) else 0, width=0.6,
+                color=c, alpha=0.6)
     n = A["name"]
     for lv, col, ls, lab in [(entry, "#ffd54f", "-", "ENTRY"), (sl, "#ef5350", "--", "SL"),
                              (t1, "#26a69a", "--", "T1"), (t2, "#26a69a", "--", "T2")]:
@@ -490,9 +620,11 @@ def make_chart(A, d, entry, sl, t1, t2, path):
             ax.axhline(lv, color=col, ls=ls, lw=1.4, label=lab)
     for lv in (A["bsl"], A["ssl"]):
         if lv: ax.axhline(lv, color="#8d6e63", ls=":", lw=1.2)
-    ax.set_title(f"{n} 15m — {d} | {A['regime']} | {A['sess']}", color="white", fontsize=12)
-    ax.tick_params(colors="white")
-    for s in ax.spines.values(): s.set_color("#444")
+    ax.set_title(f"{n} 15m — {d} | {A['regime']} | {A['sess']} | {A['source']}",
+                 color="white", fontsize=12)
+    for a_ in (ax, axv):
+        a_.tick_params(colors="white")
+        for s in a_.spines.values(): s.set_color("#444")
     ax.legend(loc="upper left", fontsize=8, facecolor="#1e222d",
               edgecolor="#444", labelcolor="white")
     plt.tight_layout(); plt.savefig(path, facecolor="#131722"); plt.close(fig)
@@ -540,11 +672,13 @@ async def voice_note(ses, tg, text):
     finally:
         if os.path.exists(path): os.remove(path)
 
-# ---------------------------------------------------------------- CORRELATION ENGINE
+# ---------------------------------------------------------------- CORRELATION
 async def corr_worker(btc: CandleStore, gold: CandleStore, out: dict):
     while True:
         try:
-            b = btc.df("5min", 288).c    # 24h of 5m closes
+            if not gold_market_open():          # frozen gold → correlation is meaningless
+                await asyncio.sleep(300); continue
+            b = btc.df("5min", 288).c
             g = gold.df("5min", 288).c
             if len(b) > 50 and len(g) > 50:
                 m = min(len(b), len(g))
@@ -556,14 +690,14 @@ async def corr_worker(btc: CandleStore, gold: CandleStore, out: dict):
             log.error(f"corr: {e}")
         await asyncio.sleep(300)
 
-# ---------------------------------------------------------------- DAY OUTLOOK (autonomous)
+# ---------------------------------------------------------------- DAY OUTLOOK
 def day_outlook(A: dict, ledger: Ledger) -> str:
     n = A["name"]; a = A["atr"]
     d, conf, votes = swarm(A)
     e, sl, t1, t2 = build_levels(A, d)
     L = [f"<b>🌍 AUTONOMOUS DAY OUTLOOK — {n}</b>",
          f"<code>{now_eat().strftime('%H:%M EAT')} | {A['sess']} | Regime {A['regime']} | "
-         f"Vol {A['atr_state']} | Align {A['align']} ({A['strength']}/3)</code>", ""]
+         f"Vol {A['atr_state']} | Align {A['align']} ({A['strength']}/3) | {A['source']}</code>", ""]
     if d == "WAIT":
         L.append("<b>PRIMARY SCENARIO (~55%):</b> Range rotation")
         L.append(f"- Rotation between {fp(A['disc'], n)} (discount) and {fp(A['prem'], n)} (premium), eq {fp(A['eq'], n)}")
@@ -593,7 +727,8 @@ def day_outlook(A: dict, ledger: Ledger) -> str:
     if A.get("corr") and abs(A["corr"]) > 0.4:
         L.append(f"\n<b>MACRO LINK:</b> Gold↔BTC r={A['corr']:.2f} — "
                  f"{'they move together; a flush in one likely drags the other' if A['corr'] > 0 else 'they are diverging; relative strength tells the story'}")
-    L.append(f"\n<code>{ledger.audit_str()} • scenarios graded automatically at expiry</code>")
+    L.append(f"\n🎓 <b>MARKET SECRET:</b> {market_lesson()}")
+    L.append(f"<code>{ledger.audit_str()} • scenarios graded automatically at expiry</code>")
     return "\n".join(L)
 
 def voice_brief(A: dict, d, conf) -> str:
@@ -611,14 +746,17 @@ async def live_loop(stores, paxg, corr, ledger, tracker, tg, ses):
     last_desk = {n: 0.0 for n in stores}
     last_event, last_event_t = {}, {}
     outlook_done = set()
+    last_gold_status = 0.0
 
-    await tg.text(ses, "<b>🛰 BRAX SMART DESK v2 — LIVE ENGINE ONLINE</b>\n"
-                       "WebSocket tick feed • 30s live tick • event alerts • "
-                       "TP/SL tracker • self-auditing predictions\n"
-                       "<code>Warming up data… first desk drop shortly.</code>")
+    await tg.text(ses, "<b>🛰 BRAX SMART DESK v3 — LIVE ENGINE ONLINE</b>\n"
+                       "BTC + PAXG: real-time WS + REST fallback (24/7)\n"
+                       "GOLD: XAU/USD spot w/ market-hours awareness\n"
+                       "Weekend = BTC + PAXG desks live • Gold auto-resumes Monday 01:00 EAT\n"
+                       "<code>Bootstrapped with 1000 bars of real history — full analysis live within minutes.</code>")
 
     while True:
         try:
+            gold_open = gold_market_open()
             prices = {n: st.price for n, st in stores.items()}
             for pr, status in ledger.check(prices):
                 await tg.text(ses, f"<b>📊 LEDGER:</b> {pr['name']} {pr['dir']} "
@@ -628,11 +766,15 @@ async def live_loop(stores, paxg, corr, ledger, tracker, tg, ses):
             # autonomous outlook at London open (08:00) and NY killzone (13:00) EAT
             t = now_eat()
             key = (t.date(), t.hour)
-            if t.hour in (8, 13) and key not in outlook_done and all(s.price > 0 for s in stores.values()):
+            if t.hour in (8, 13) and key not in outlook_done:
                 outlook_done.add(key)
-                for n, st in stores.items():
+                for n in ("BITCOIN", "GOLD", "PAXG"):
+                    if n == "GOLD" and not gold_open:
+                        continue
+                    st = stores[n]
+                    if st.price <= 0: continue
                     proxy = paxg if n == "GOLD" else None
-                    A = analyze(st, proxy, corr.get("val", 0.0))
+                    A = analyze(st, proxy, corr.get("val", 0.0), market_open=True)
                     if A["full"]:
                         await tg.text(ses, day_outlook(A, ledger))
                         d, conf, _ = swarm(A)
@@ -644,18 +786,36 @@ async def live_loop(stores, paxg, corr, ledger, tracker, tg, ses):
             for n, st in stores.items():
                 if st.price <= 0:
                     continue
-                proxy = paxg if n == "GOLD" else None
-                A = analyze(st, proxy, corr.get("val", 0.0))
-                if not A["full"]:
+
+                # --- GOLD spot closed: honest status, zero fake signals
+                if n == "GOLD" and not gold_open:
+                    if time.time() - last_gold_status >= GOLD_STATUS_INTERVAL:
+                        last_gold_status = time.time()
+                        px = gold.price or paxg.price
+                        await tg.text(ses,
+                            f"<b>🟡 GOLD — XAU/USD SPOT MARKET CLOSED</b>\n"
+                            f"Last close: <b>{fp(px, 'GOLD')}</b> ({gold.source})\n"
+                            f"Spot reopens: <b>{gold_next_open_eat().strftime('%a %H:%M EAT')}</b>\n"
+                            f"Weekend 'gold moves' are stale Friday quotes — signals suppressed.\n"
+                            f"<b>Live alternative:</b> PAXG desk is running (24/7 tokenized gold) "
+                            f"@ {fp(paxg.price, 'PAXG')}\n"
+                            f"<code>{ledger.audit_str()}</code>")
                     continue
 
-                # --- TP/SL tracker (fires instantly)
+                proxy = paxg if n == "GOLD" else None
+                A = analyze(st, proxy, corr.get("val", 0.0), market_open=True)
+                if not A["full"]:
+                    if time.time() - last_desk[n] >= DESK_INTERVAL:
+                        last_desk[n] = time.time()
+                        await tg.text(ses, f"<b>{n}</b>: warming up — {len(st.df('15min'))}/20 15m bars "
+                                           f"({A['source']}, price {fp(st.price, n)})")
+                    continue
+
                 for msg in tracker.check(A):
                     await tg.text(ses, msg)
                     await voice_note(ses, tg, msg.replace("🎯", "")
                                           .replace("🏁", "").replace("🛑", ""))
 
-                # --- instant event alerts (BOS change / liquidity sweep)
                 ev = f"{A['bos']}|{A['sweep_bsl']}|{A['sweep_ssl']}"
                 if n in last_event and ev != last_event[n] and time.time() - last_event_t.get(n, 0) > 300:
                     parts = []
@@ -669,11 +829,10 @@ async def live_loop(stores, paxg, corr, ledger, tracker, tg, ses):
                     if parts:
                         await tg.text(ses, f"<b>{n} EVENT</b> @ {fp(A['price'], n)}\n"
                                      + "\n".join(parts)
-                                     + f"\n<code>{now_eat().strftime('%H:%M:%S EAT')} • detected within seconds of print</code>")
+                                     + f"\n<code>{now_eat().strftime('%H:%M:%S EAT')} • feed {A['source']}</code>")
                     last_event_t[n] = time.time()
                 last_event[n] = ev
 
-                # --- full desk drop every 15 min per asset
                 if time.time() - last_desk[n] >= DESK_INTERVAL:
                     last_desk[n] = time.time()
                     d, conf, votes = swarm(A)
@@ -681,17 +840,17 @@ async def live_loop(stores, paxg, corr, ledger, tracker, tg, ses):
                     if d != "WAIT" and n not in tracker.active and conf >= 68:
                         e, sl, t1, t2 = build_levels(A, d)
                         tracker.arm(A, d, conf, e, sl, t1, t2)
-                        path = f"/tmp/{n.replace('/', '')}.png"
+                        path = f"/tmp/{n.replace('/', '').replace(' ', '')}.png"
                         await asyncio.to_thread(make_chart, A, d, e, sl, t1, t2, path)
                         await tg.photo(ses, path, f"{n} — {d} {conf}% | {A['sess']} | {A['regime']}")
                         if os.path.exists(path): os.remove(path)
                         await voice_note(ses, tg, voice_brief(A, d, conf))
-                    log.info(f"Desk → {n} | {d} {conf}% | full")
+                    log.info(f"Desk → {n} | {d} {conf}% | feed {A['source']}")
         except Exception as e:
             log.error(f"live_loop: {e}")
         await asyncio.sleep(TICK_INTERVAL)
 
-# ---------------------------------------------------------------- KEEPALIVE (Render free tier)
+# ---------------------------------------------------------------- KEEPALIVE
 async def keepalive(ses):
     if not SELF_URL:
         return
@@ -706,19 +865,24 @@ async def keepalive(ses):
 async def main():
     btc  = CandleStore("BITCOIN", ws_sym="btcusdt")
     paxg = CandleStore("PAXG",    ws_sym="paxgusdt")
-    gold = CandleStore("GOLD")            # TwelveData poll + goldprice.org backup
+    gold = CandleStore("GOLD")
     corr = {"val": 0.0}
     ledger, tracker = Ledger(), Tracker()
     tg = TG()
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as ses:
+        # seed real history FIRST so the engine is fully armed within ~1 minute of boot
+        await bootstrap_crypto([btc, paxg], ses)
+        await bootstrap_gold(gold, ses)
+
         tasks = [asyncio.create_task(binance_worker([btc, paxg])),
+                 asyncio.create_task(crypto_rest_fallback([btc, paxg], ses)),
                  asyncio.create_task(gold_worker(gold, ses)),
-                 asyncio.create_task(corr_worker(btc, paxg, corr)),
+                 asyncio.create_task(corr_worker(btc, gold, corr)),
                  asyncio.create_task(keepalive(ses))]
         try:
-            await live_loop({"BITCOIN": btc, "GOLD": gold}, paxg, corr,
-                            ledger, tracker, tg, ses)
+            await live_loop({"BITCOIN": btc, "GOLD": gold, "PAXG": paxg},
+                            paxg, corr, ledger, tracker, tg, ses)
         finally:
             for t in tasks:
                 t.cancel()
@@ -727,7 +891,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def health():
-    return "BRAX SMART DESK v2 — LIVE ENGINE RUNNING", 200
+    return "BRAX SMART DESK v3 — LIVE ENGINE RUNNING", 200
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), use_reloader=False)
