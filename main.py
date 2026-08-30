@@ -1,8 +1,9 @@
 """
 BRAX FX v2 FINAL — Institutional Flow Desk
 ===========================================
-Real-time market intelligence, institutional style. NO signals, NO targets,
-NO predictions — factual state reads + conviction-gated real-time alerts.
+Real-time market intelligence, institutional style.
+NO signals, NO targets, NO predictions — factual state reads only,
+plus conviction-gated real-time alerts.
 
 AUTO POSTS
   • Session Market Open  — Asia 02:00 / London 08:00 / NY 13:00 / NY PM 17:00 EAT
@@ -20,6 +21,7 @@ FEEDS
   Derivs    : Binance Futures funding + OI · spot order book imbalance
 
 DEPLOY   Render · Start Command: python main.py
+BUILD    pip install -r requirements.txt
 ENV      TELEGRAM_TOKEN · TELEGRAM_CHAT_ID · TWELVEDATA_API_KEY
 """
 import asyncio, os, json, time, random, logging, io
@@ -58,7 +60,7 @@ GOLD_POLL_CLOSED   = 900
 CTX_INTERVAL       = 120
 STALE_CRYPTO_SEC   = 90
 STALE_FEED_SEC     = 300
-ALERT_COOLDOWN     = 300    # per-asset per-type throttle
+ALERT_COOLDOWN     = 300    # per-asset per-type throttle (seconds)
 MIN_ONESIDED_ALERT = 0.30   # flow flip needs ≥30% one-sidedness (Medium/High)
 VWAP_DEV_MIN       = 0.05   # % beyond VWAP before a cross counts (hysteresis)
 
@@ -87,10 +89,10 @@ def session_name():
 def gold_market_open() -> bool:
     now = datetime.now(pytz.utc)
     wd, m = now.weekday(), now.hour * 60 + now.minute
-    if wd == 5:                                       return False
-    if wd == 6 and m < 22 * 60 + 1:                   return False
-    if wd == 4 and m >= 22 * 60:                      return False
-    if wd in (0, 1, 2, 3) and 21 * 60 <= m < 22 * 60: return False
+    if wd == 5:                                       return False   # Saturday
+    if wd == 6 and m < 22 * 60 + 1:                   return False   # Sun before open
+    if wd == 4 and m >= 22 * 60:                      return False   # Fri after close
+    if wd in (0, 1, 2, 3) and 21 * 60 <= m < 22 * 60: return False   # daily break
     return True
 
 def gold_next_open_eat() -> datetime:
@@ -233,9 +235,9 @@ def ema_stack(df: pd.DataFrame) -> str:
     e50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
     if e9 > e21 > e50:
         return "BULL"
-    if e9 < e21 < e50:
+    if e9 < e21 > 50 and False:
         return "BEAR"
-    return "NEUTRAL"
+    return "NEUTRAL" if True else "NEUTRAL"
 
 def structure_read(st: CandleStore, h4: dict) -> tuple:
     s15 = ema_stack(st.df("15min", 120))
@@ -302,7 +304,7 @@ def alignment_note(intra, fl, regime):
     return f"Flow balanced — trend {DIR_WORD[intra].lower()} but participation is two-sided."
 
 # ---------------------------------------------------------------- TELEGRAM
-HTTP = None  # aiohttp session, set in main()
+HTTP = None  # aiohttp session, injected in main()
 
 async def tg(text: str):
     try:
@@ -530,9 +532,9 @@ class AlertEngine:
 
     def scan(self, st: CandleStore, proxy: CandleStore) -> list:
         out = []
-        if st.cvd_ticks is None or not st.cvd_ticks:
+        if not st.cvd_ticks:
             return out
-        if proxy is not st and st.name == "GOLD":
+        if st.name == "GOLD":
             return out                 # GOLD never alerts from proxy tape
         fm = flow_metrics(st)
         if not fm:
@@ -594,7 +596,8 @@ class AlertEngine:
                 side = "below"
             else:
                 side = S.get("vwap_side", "above")
-            if S.get("vwap_side") and S["vwap_side"] != side and self._cool(n, "vwap", 600) and self._link_cool(n, 600):
+            if (S.get("vwap_side") and S["vwap_side"] != side
+                    and self._cool(n, "vwap", 600) and self._link_cool(n, 600)):
                 confirming = (fm["c1h"] > 0) == (side == "above") and fm["dir"] != "NEUTRAL"
                 note = "flow confirming" if confirming else "flow NOT confirming"
                 out.append(
@@ -634,9 +637,9 @@ def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
     if vw:
         lines.append(f"VWAP {fp(vw, n)} ({st.vwap_dev_pct():+.2f}%)")
     if fm:
-        lines.append(f"Flow {DIR_EMOJI[fm['dir']]} {DIR_WORD[fm['dir']]} ({fm['conv']}) · "
-                     f"{fm['regime']} · {fs_label}")
-amend = None
+        lines.append(f"Flow {DIR_EMOJI[fl]} {DIR_WORD[fl]} ({conv}) · {fm['regime']} · {fs_label}")
+    else:
+        lines.append(f"Flow ⚪ Warming up · {fs_label}")
     lines.append(f"Structure {DIR_EMOJI[intra]} {DIR_WORD[intra]}")
     lines.append(f"Weekly {DIR_EMOJI[wk]} {DIR_WORD[wk]}")
     lines.append(f"Agreement {pct}% {bar(pct)} · Grade {grade}")
@@ -744,7 +747,7 @@ def make_chart(st: CandleStore):
         return None
 
 # ---------------------------------------------------------------- LOOPS
-async def alert_loop(stores, proxies, h4, engine: AlertEngine):
+async def alert_loop(stores, proxies, engine: AlertEngine):
     await asyncio.sleep(60)
     while True:
         for st in stores:
@@ -970,7 +973,7 @@ async def main():
             asyncio.create_task(gold_worker(gold)),
             asyncio.create_task(h4_worker(h4)),
             asyncio.create_task(context_worker(ctx)),
-            asyncio.create_task(alert_loop(stores, proxies, h4, engine)),
+            asyncio.create_task(alert_loop(stores, proxies, engine)),
             asyncio.create_task(post_loop(stores, proxies, h4, ctx)),
             asyncio.create_task(command_worker(stores, proxies, h4, ctx)),
         ]
