@@ -1,30 +1,35 @@
 """
-BRAX FX v2 FINAL — Institutional Flow Desk
-===========================================
-Real-time market intelligence, institutional style.
-NO signals, NO targets, NO predictions — factual state reads only,
-plus conviction-gated real-time alerts.
+BRAX FX v3 — Autonomous Flow, Manipulation & Signal Desk (COMPLETE)
+====================================================================
+Assets: BITCOIN (24/7 live tape) · GOLD (spot-hours aware; flow via PAXG tape)
 
-AUTO POSTS
-  • Session Market Open  — Asia 02:00 / London 08:00 / NY 13:00 / NY PM 17:00 EAT
-  • FLOW UPDATE          — hourly inside each session
-  • REAL-TIME ALERTS     — flow flip (≥30% one-sidedness) · absorption ·
-                           liquidity sweep · VWAP cross (hysteresis-gated)
-                           GOLD/PAXG deduplicated · never from proxy data
+AUTO POSTS (fully autonomous)
+  • DAILY OUTLOOK     — 07:00 EAT daily: prose narrative + sessions + news
+  • SESSION OPEN      — Asia 02:00 / London 08:00 / NY 13:00 / NY PM 17:00 EAT
+  • FLOW UPDATE       — hourly in-session
+  • REAL-TIME ALERTS  — flow flip · absorption · liquidity sweep · VWAP cross
+  • MANIPULATION      — stop hunts · fake breakouts · squeeze traps
+  • A+ SIGNALS        — >=8/10 confluence, ATR SL/TP, tracked to outcome
+  • NEWS ALERTS       — 15 min before high-impact USD events
   • NY Close 21:00 · Weekend Review Sat 10:00 · Reopen notice Sun 21:30 EAT
 
-COMMANDS  /now /flow /book /derivs /chart /health /help
+COMMANDS  /now /flow /signal /health /help
 
-FEEDS
-  BTC, PAXG : Binance WS kline_1m + aggTrade (24/7) · REST bootstrap ~33h · fallback
-  XAU/USD   : TwelveData 1min, spot-hours aware · goldprice.org backup
-  Derivs    : Binance Futures funding + OI · spot order book imbalance
+SIGNAL RULES
+  • BTC only (gold has no live aggressor tape — no honest gold signals)
+  • Score >= 8/10 confluence · max 2/day · 4h cooldown
+  • Skipped 15 min around high-impact USD news
+  • Every signal tracked: TP1 -> TP2 or SL, reported publicly
 
-DEPLOY   Render · Start Command: python main.py
-BUILD    pip install -r requirements.txt
+MANIPULATION MODULE
+  • Stop hunts:   wick beyond a swing level that closes back inside
+  • Fake breaks:  level break on weak/expiring CVD then immediate reversal
+  • Squeeze trap: fast flush against crowd funding, then immediate retrace
+
+DEPLOY   Render · Start: python main.py · Build: pip install -r requirements.txt
 ENV      TELEGRAM_TOKEN · TELEGRAM_CHAT_ID · TWELVEDATA_API_KEY
 """
-import asyncio, os, json, time, random, logging, io
+import asyncio, os, json, time, random, logging
 from collections import deque
 from datetime import datetime, timedelta
 import numpy as np
@@ -46,27 +51,34 @@ log = logging.getLogger("BRAXFX")
 TOKEN    = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
 TD_KEY   = os.getenv("TWELVEDATA_API_KEY")
-SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 PORT     = int(os.getenv("PORT", "10000"))
 
 BINANCE_REST  = "https://data-api.binance.vision/api/v3"
 BINANCE_FAPI  = "https://fapi.binance.com"
 BINANCE_HOSTS = ["wss://data-stream.binance.vision/stream?streams=",
                  "wss://stream.binance.com:9443/stream?streams="]
+FF_CAL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-TICK_INTERVAL      = 10     # alert scan every 10s → real-time
+TICK_INTERVAL      = 10
 GOLD_POLL          = 120
 GOLD_POLL_CLOSED   = 900
 CTX_INTERVAL       = 120
 STALE_CRYPTO_SEC   = 90
 STALE_FEED_SEC     = 300
-ALERT_COOLDOWN     = 300    # per-asset per-type throttle (seconds)
-MIN_ONESIDED_ALERT = 0.30   # flow flip needs ≥30% one-sidedness (Medium/High)
-VWAP_DEV_MIN       = 0.05   # % beyond VWAP before a cross counts (hysteresis)
+ALERT_COOLDOWN     = 300
+MIN_ONESIDED_ALERT = 0.30
+VWAP_DEV_MIN       = 0.05
+SIGNAL_MIN_SCORE   = 8
+SIGNAL_COOLDOWN    = 4 * 3600
+MAX_SIGNALS_DAY    = 2
+ATR_SL_MULT        = 1.5
+TP1_R              = 1.5
+TP2_R              = 2.5
+NEWS_BLACKOUT_MIN  = 15
 
 EAT   = pytz.timezone("Africa/Nairobi")
-BRAND = "BRAX FX // INSTITUTIONAL FLOW DESK"
-FOOT  = "BRAX FX · Institutional Flow Desk\nEducational market intelligence. Not financial advice."
+BRAND = "BRAX FX // FLOW & SIGNAL DESK"
+FOOT  = "BRAX FX · Autonomous Flow & Signal Desk\nEducational analysis. Not financial advice. Trading carries risk."
 
 for _v in (TOKEN, CHAT_ID, TD_KEY):
     if not _v:
@@ -85,14 +97,13 @@ def session_name():
             return name
     return None
 
-# ---------------------------------------------------------------- XAU SPOT HOURS
 def gold_market_open() -> bool:
     now = datetime.now(pytz.utc)
     wd, m = now.weekday(), now.hour * 60 + now.minute
-    if wd == 5:                                       return False   # Saturday
-    if wd == 6 and m < 22 * 60 + 1:                   return False   # Sun before open
-    if wd == 4 and m >= 22 * 60:                      return False   # Fri after close
-    if wd in (0, 1, 2, 3) and 21 * 60 <= m < 22 * 60: return False   # daily break
+    if wd == 5:                                       return False
+    if wd == 6 and m < 22 * 60 + 1:                   return False
+    if wd == 4 and m >= 22 * 60:                      return False
+    if wd in (0, 1, 2, 3) and 21 * 60 <= m < 22 * 60: return False
     return True
 
 def gold_next_open_eat() -> datetime:
@@ -120,104 +131,98 @@ def bar(pct: int) -> str:
     filled = max(1, round(pct / 10)) if pct > 0 else 0
     return "█" * filled + "░" * (10 - filled)
 
+def atr(df: pd.DataFrame, n=14) -> float:
+    if len(df) < n + 1:
+        return 0.0
+    hl = df.h - df.l
+    hc = (df.h - df.c.shift()).abs()
+    lc = (df.l - df.c.shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    val = float(tr.rolling(n).mean().iloc[-1])
+    return val if not pd.isna(val) else 0.0
+
 # ---------------------------------------------------------------- CANDLE + FLOW STORE
 class CandleStore:
     def __init__(self, name, ws_sym=None):
         self.name, self.ws_sym = name, ws_sym
-        self._c = {}                          # minute-epoch -> [o,h,l,c,v]
+        self._c = {}                       # epoch_min -> [o,h,l,c,v]
         self._df, self._df_ts = None, 0.0
         self.price, self.day_open = 0.0, None
-        self.cvd_ticks = deque(maxlen=60000)  # (ts_sec, signed base volume)
+        self.cvd_ticks = deque(maxlen=60000)   # (ts_sec, signed_qty, price)
         self.last_update = 0.0
         self.source = "—"
 
     def _update_day_open(self):
-        utc_mid = datetime.now(pytz.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0).timestamp() // 60
-        todays = [cd[0] for tt, cd in self._c.items() if tt >= utc_mid]
-        if todays:
-            self.day_open = todays[0]
+        if self.day_open is None:
+            first_min = min(self._c)
+            self.day_open = self._c[first_min][0]
 
-    def ingest_kline(self, k):
-        self.ingest_kline_tuple(int(k["t"]) // 60000, float(k["o"]), float(k["h"]),
-                                float(k["l"]), float(k["c"]), float(k["v"]))
-
-    def ingest_kline_tuple(self, t_min, o, h, l, c, v):
-        self._c[int(t_min)] = [o, h, l, c, v]
+    def _ingest_min(self, m, o, h, l, c, v):
+        if m in self._c:
+            bar = self._c[m]
+            bar[1], bar[2], bar[3], bar[4] = max(bar[1], h), min(bar[2], l), c, c
+            bar[4] = c
+            self._c[m] = [bar[0], bar[1], bar[2], c, bar[4] + v - bar[4] + v]
+            # keep simple: last close, accumulate volume
+            self._c[m] = [bar[0], max(bar[1], h), min(bar[2], l), c, self._c[m][4]]
+        else:
+            self._c[m] = [o, h, l, c, v]
         self.price = c
         self.last_update = time.time()
-        self._trim(); self._df = None; self._update_day_open()
-
-    def ingest_trade(self, t):
-        p, q = float(t["p"]), float(t["q"])
-        signed = -q if t["m"] else q          # m=True → buyer was maker → sell aggressor
-        self.cvd_ticks.append((int(t["T"]) / 1000, signed))
-        self.price = p
-        self.last_update = time.time()
         self._df = None
+        self._update_day_open()
+
+    def ingest_kline(self, k):
+        m = int(k["t"]) // 60000
+        self._ingest_min(m, float(k["o"]), float(k["h"]), float(k["l"]),
+                         float(k["c"]), float(k["v"]))
+
+    def ingest_kline_tuple(self, m, o, h, l, c, v):
+        self._ingest_min(m, o, h, l, c, v)
 
     def ingest_td(self, values):
-        for r in values:
-            try:
-                dt = datetime.strptime(r["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
-                ts = int(dt.timestamp() // 60)
-                self._c[ts] = [float(r["open"]), float(r["high"]),
-                               float(r["low"]), float(r["close"]), float(r.get("volume") or 0)]
-            except Exception:
-                continue
-        if values:
-            self.price = float(values[0]["close"])
+        """TwelveData bars, newest-first."""
+        for row in reversed(values):
+            dt = datetime.fromisoformat(row["datetime"].replace("Z", ""))
+            m = int(dt.timestamp() // 60)
+            self._ingest_min(m, float(row["open"]), float(row["high"]),
+                             float(row["low"]), float(row["close"]),
+                             float(row.get("volume") or 0))
         self.last_update = time.time()
-        self._trim(); self._df = None; self._update_day_open()
 
-    def _trim(self):
-        cutoff = (time.time() - 5 * 86400) // 60      # MINUTE-epoch cutoff (critical fix)
-        for k in [k for k in self._c if k < cutoff]:
-            del self._c[k]
+    def ingest_trade(self, t):
+        p = float(t["p"]); q = float(t["q"])
+        is_sell = bool(t.get("m", t.get("isBuyerMaker", False)))
+        signed = -q if is_sell else q
+        ts = t.get("T") or int(time.time() * 1000)
+        self.cvd_ticks.append((ts_sec(ts), signed, p))
+        self.last_update = time.time()
 
-    def data_age(self) -> float:
+    def df(self, rule="1min", limit=200) -> pd.DataFrame:
         if not self._c:
-            return 1e9
-        return time.time() - max(self._c) * 60
-
-    def df(self, rule="1min", bars=None) -> pd.DataFrame:
-        if not self._c:
-            return pd.DataFrame()
-        if self._df is None or time.time() - self._df_ts > 3:
-            items = sorted(self._c.items())
-            idx = pd.to_datetime([i[0] * 60 for i in items], unit="s", utc=True)
-            self._df = pd.DataFrame([i[1] for i in items], index=idx,
-                                    columns=["o", "h", "l", "c", "v"])
-            self._df_ts = time.time()
-        df = self._df
+            return pd.DataFrame(columns=["o", "h", "l", "c", "v"])
+        now = time.time()
+        if self._df is None or now - self._df_ts > 30:
+            d = pd.DataFrame.from_dict(self._c, orient="index",
+                                       columns=["o", "h", "l", "c", "v"])
+            d.index = pd.to_datetime(d.index * 60, unit="s")
+            self._df, self._df_ts = d, now
+        d = self._df
         if rule != "1min":
-            df = df.resample(rule).agg({"o": "first", "h": "max", "l": "min",
-                                        "c": "last", "v": "sum"}).dropna()
-        return df.tail(bars) if bars else df
+            d = d.resample(rule).agg({"o": "first", "h": "max",
+                                      "l": "min", "c": "last", "v": "sum"}).dropna()
+        return d.tail(limit)
 
-    # ---- flow primitives (real aggressor trades)
-    def cvd(self, window=3600) -> float:
-        cut = time.time() - window
-        return sum(v for ts, v in self.cvd_ticks if ts >= cut)
-
-    def total_vol(self, window=3600) -> float:
-        cut = time.time() - window
-        return sum(abs(v) for ts, v in self.cvd_ticks if ts >= cut)
-
-    # ---- VWAP (UTC day, from 1m bars)
     def vwap(self):
-        df = self.df("1min")
-        if df.empty:
+        if self.day_open is None or not self.price:
             return None
-        today = df[df.index >= df.index[-1].floor("D")]
-        if today.empty:
+        rows = [v for k, v in self._c.items()
+                if k >= day_start_min() and v[4] > 0]
+        if not rows:
             return None
-        tp = (today.h + today.l + today.c) / 3
-        v = today.v
-        vs = float(v.sum())
-        if vs > 0:
-            return float((tp * v).sum() / vs)
-        return float(tp.mean())
+        pv = sum(r[3] * r[4] for r in rows)
+        vv = sum(r[4] for r in rows)
+        return pv / vv if vv > 0 else None
 
     def vwap_dev_pct(self) -> float:
         vw = self.vwap()
@@ -225,93 +230,157 @@ class CandleStore:
             return 0.0
         return (self.price - vw) / vw * 100
 
-# ---------------------------------------------------------------- INDICATORS
-def ema_stack(df: pd.DataFrame) -> str:
-    if len(df) < 55:
-        return "NEUTRAL"
-    c = df.c
-    e9  = float(c.ewm(span=9,  adjust=False).mean().iloc[-1])
-    e21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
-    e50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
-    if e9 > e21 > e50:
-        return "BULL"
-    if e9 < e21 > 50 and False:
-        return "BEAR"
-    return "NEUTRAL" if True else "NEUTRAL"
+    def data_age(self) -> float:
+        return time.time() - self.last_update
 
-def structure_read(st: CandleStore, h4: dict) -> tuple:
-    s15 = ema_stack(st.df("15min", 120))
-    s1h = ema_stack(st.df("1h", 120))
-    if s1h == s15:
-        intra = s1h
-    elif s1h == "NEUTRAL":
-        intra = s15
-    elif s15 == "NEUTRAL":
-        intra = s1h
+def ts_sec(ms):
+    return ms / 1000 if ms > 1e11 else ms
+
+def day_start_min() -> int:
+    n = datetime.now(EAT).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(n.timestamp() // 60)
+
+# ---------------------------------------------------------------- FLOW METRICS
+def cvd_window(st: CandleStore, seconds: int) -> float:
+    if not st.cvd_ticks:
+        return 0.0
+    cutoff = time.time() - seconds
+    return float(sum(s for t, s, p in st.cvd_ticks if t >= cutoff))
+
+def flow_metrics(st: CandleStore):
+    if not st.cvd_ticks or st.data_age() > STALE_FEED_SEC:
+        return None
+    c15, c1h = cvd_window(st, 900), cvd_window(st, 3600)
+    v15, v1h = cvd_window(st, 900, signed=False), cvd_window(st, 3600, signed=False)
+    ones15 = abs(c15) / v15 if v15 > 0 else 0.0
+    ones1h = abs(c1h) / v1h if v1h > 0 else 0.0
+    if c1h > 0 and ones1h >= MIN_ONESIDED_ALERT:
+        d = "BULL"
+    elif c1h < 0 and ones1h >= MIN_ONESIDED_ALERT:
+        d = "BEAR"
+    elif c15 > 0:
+        d = "BULL"
+    elif c15 < 0:
+        d = "BEAR"
     else:
-        intra = "NEUTRAL"
-    wk = "NEUTRAL"
-    s = h4.get(st.name)
-    if s is not None and len(s) >= 55:
-        e9  = float(s.ewm(span=9,  adjust=False).mean().iloc[-1])
-        e21 = float(s.ewm(span=21, adjust=False).mean().iloc[-1])
-        e50 = float(s.ewm(span=50, adjust=False).mean().iloc[-1])
-        wk = "BULL" if e9 > e21 > e50 else "BEAR" if e9 < e21 < e50 else "NEUTRAL"
+        d = "NEUTRAL"
+    conv = "High" if ones1h >= 0.45 else ("Medium" if ones1h >= MIN_ONESIDED_ALERT else "Low")
+    if d == "BULL":
+        regime = "ACCUMULATION" if c15 > 0 else "PULLBACK-BUYING"
+    elif d == "BEAR":
+        regime = "DISTRIBUTION" if c15 < 0 else "RALLY-SELLING"
+    else:
+        regime = "CHOP"
+    return {"dir": d, "c15": c15, "c1h": c1h, "ones15": ones15,
+            "ones1h": ones1h, "conv": conv, "regime": regime}
+
+def _cvd_window_raw(st, seconds, signed=True):
+    cutoff = time.time() - seconds
+    tot = 0.0
+    for t, s, p in st.cvd_ticks:
+        if t >= cutoff:
+            tot += (s if signed else abs(s))
+    return tot
+
+def flow_metrics(st: CandleStore):
+    if not st.cvd_ticks or st.data_age() > STALE_FEED_SEC:
+        return None
+    c15, c1h = _cvd_window_raw(st, 900, True), _cvd_window_raw(st, 3600, True)
+    v15, v1h = _cvd_window_raw(st, 900, False), _cvd_window_raw(st, 3600, False)
+    ones15 = abs(c15) / v15 if v15 > 0 else 0.0
+    ones1h = abs(c1h) / v1h if v1h > 0 else 0.0
+    if c1h > 0 and ones1h >= MIN_ONESIDED_ALERT:
+        d = "BULL"
+    elif c1h < 0 and ones1h >= MIN_ONESIDED_ALERT:
+        d = "BEAR"
+    elif c15 > 0:
+        d = "BULL"
+    elif c15 < 0:
+        d = "BEAR"
+    else:
+        d = "NEUTRAL"
+    conv = "High" if ones1h >= 0.45 else ("Medium" if ones1h >= MIN_ONESIDED_ALERT else "Low")
+    if d == "BULL":
+        regime = "ACCUMULATION" if c15 > 0 else "PULLBACK-BUYING"
+    elif d == "BEAR":
+        regime = "DISTRIBUTION" if c15 < 0 else "RALLY-SELLING"
+    else:
+        regime = "CHOP"
+    return {"dir": d, "c15": c15, "c1h": c1h, "ones15": ones15,
+            "ones1h": ones1h, "conv": conv, "regime": regime}
+
+# ---------------------------------------------------------------- STRUCTURE + AGREEMENT
+def structure_read(st: CandleStore, h4: dict):
+    intra, wk = "NEUTRAL", "NEUTRAL"
+    d = st.df("1h", 60)
+    if len(d) >= 20:
+        last = float(d.c.iloc[-1])
+        swing_h, swing_l = float(d.h.iloc[:-1].max()), float(d.l.iloc[:-1].min())
+        if last > swing_h:
+            intra = "BULL"
+        elif last < swing_l:
+            intra = "BEAR"
+        else:
+            ma = float(d.c.rolling(20).mean().iloc[-1])
+            intra = "BULL" if last > ma else ("BEAR" if last < ma else "NEUTRAL")
+    closes = h4.get(st.name)
+    if closes is not None and len(closes) >= 60:
+        last, ma20, ma50 = (float(closes.iloc[-1]),
+                            float(closes.tail(20).mean()),
+                            float(closes.tail(50).mean()))
+        if ma20 > ma50 and last > ma20:
+            wk = "BULL"
+        elif ma20 < ma50 and last < ma20:
+            wk = "BEAR"
     return intra, wk
 
-def flow_metrics(fs: CandleStore):
-    """Institutional flow read from real aggressor trades."""
-    if fs is None or not fs.cvd_ticks:
-        return None
-    c15, c1h, c3h = fs.cvd(900), fs.cvd(3600), fs.cvd(10800)
-    tot15, tot1h = fs.total_vol(900), fs.total_vol(3600)
-    if tot15 <= 0 or tot1h <= 0:
-        return None
-    ones15 = abs(c15) / tot15
-    ones1h = abs(c1h) / tot1h
-    direction = "BULL" if c1h > 0 else "BEAR" if c1h < 0 else "NEUTRAL"
-    conv = "High" if ones1h > 0.60 else "Medium" if ones1h > 0.30 else "Low"
-    if abs(c15) < 0.25 * tot15:
-        regime = "BALANCED"
-    elif (c15 > 0) == (c1h > 0):
-        regime = "ACCUMULATION" if c1h > 0 else "DISTRIBUTION"
-    else:
-        regime = "ABSORPTION"
-    return {"c15": c15, "c1h": c1h, "c3h": c3h,
-            "ones15": ones15, "ones1h": ones1h,
-            "dir": direction, "conv": conv, "regime": regime}
+def agreement(intra: str, flow: str):
+    if intra == "NEUTRAL" or flow == "NEUTRAL":
+        return 50, "MIXED"
+    if intra == flow:
+        return 90, "A"
+    return 20, "C"
 
-def agreement(intra: str, flow: str) -> tuple:
-    if intra == flow and intra != "NEUTRAL":
-        pct = 100
-    elif "NEUTRAL" in (intra, flow):
-        pct = 67
-    else:
-        pct = 33
-    grade = "A" if pct >= 80 else "B" if pct >= 65 else "C"
-    return pct, grade
-
-def alignment_note(intra, fl, regime):
-    if regime == "ABSORPTION":
-        return "⚠️ Absorption — short-window flow fights the larger flow; one side is being absorbed at these prices."
-    if intra == fl and intra != "NEUTRAL":
-        return f"Structure and flow aligned {DIR_WORD[intra].lower()} — participation confirms direction."
-    if intra != "NEUTRAL" and fl != "NEUTRAL":
-        return (f"Structure {DIR_WORD[intra].lower()} but flow {DIR_WORD[fl].lower()} — "
-                "participation is not confirming direction.")
-    if intra == "NEUTRAL":
-        return f"Structure neutral — flow is {DIR_WORD[fl].lower()} without trend confirmation."
-    return f"Flow balanced — trend {DIR_WORD[intra].lower()} but participation is two-sided."
+# ---------------------------------------------------------------- CHART
+def render_chart(st: CandleStore, out_path: str):
+    df = st.df("15min", 96)
+    if df.empty:
+        return None
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+                                   gridspec_kw={"height_ratios": [3, 1]})
+    x = np.arange(len(df))
+    up = df.c >= df.o
+    ax1.vlines(x, df.l, df.h, color=np.where(up, "#26a69a", "#ef5350"), lw=0.8)
+    ax1.bar(x, (df.c - df.o), 0.6, bottom=df.o,
+            color=np.where(up, "#26a69a", "#ef5350"))
+    vw = st.vwap()
+    if vw:
+        ax1.axhline(vw, ls="--", c="#f0b90b", lw=1, label="Session VWAP")
+    sig = SIGNAL_ENGINE.active.get(st.name) if "SIGNAL_ENGINE" in globals() else None
+    if sig:
+        for lvl, lbl in ((sig["entry"], "Entry"), (sig["sl"], "SL"),
+                         (sig["tp1"], "TP1"), (sig["tp2"], "TP2")):
+            ax1.axhline(lvl, ls=":", lw=1)
+            ax1.annotate(lbl, (0, lvl), fontsize=7, va="bottom")
+    ax1.set_title(f"{st.name} 15m — {fp(st.price, st.name)}", fontsize=11)
+    ax1.legend(fontsize=7)
+    cum = np.cumsum([s for _, s, _ in st.cvd_ticks])[-len(df):] if st.cvd_ticks else x * 0
+    ax2.fill_between(x, cum, color="#42a5f5", alpha=0.4)
+    ax2.set_title("Tick CVD (session)", fontsize=8)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+    return out_path
 
 # ---------------------------------------------------------------- TELEGRAM
-HTTP = None  # aiohttp session, injected in main()
+HTTP = None
 
-async def tg(text: str):
+async def tg_send(text: str):
     try:
-        async with HTTP.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True}) as r:
+        async with HTTP.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                             json={"chat_id": CHAT_ID, "text": text,
+                                   "parse_mode": "HTML",
+                                   "disable_web_page_preview": True}) as r:
             if r.status != 200:
                 log.error(f"TG send {r.status}: {await r.text()}")
     except Exception as e:
@@ -322,6 +391,7 @@ async def tg_photo(png: bytes, caption: str):
         form = aiohttp.FormData()
         form.add_field("chat_id", CHAT_ID)
         form.add_field("caption", caption)
+        form.add_field("parse_mode", "HTML")
         form.add_field("photo", png, filename="chart.png")
         async with HTTP.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto", data=form) as r:
             if r.status != 200:
@@ -335,8 +405,6 @@ async def binance_worker(stores: list):
     for s in stores:
         if s.ws_sym:
             streams += [f"{s.ws_sym}@kline_1m", f"{s.ws_sym}@aggTrade"]
-    if not streams:
-        return
     backoff = 5
     while True:
         host = random.choice(BINANCE_HOSTS)
@@ -453,7 +521,7 @@ async def gold_worker(gold: CandleStore):
 async def h4_worker(h4: dict):
     while True:
         try:
-            for sym, name in (("BTCUSDT", "BITCOIN"), ("PAXGUSDT", "PAXG")):
+            for sym, name in (("BTCUSDT", "BITCOIN"), ("PAXGUSDT", "GOLD")):
                 async with HTTP.get(f"{BINANCE_REST}/klines?symbol={sym}&interval=4h&limit=120") as r:
                     kl = await r.json()
                 if isinstance(kl, list) and kl:
@@ -469,7 +537,7 @@ async def h4_worker(h4: dict):
         await asyncio.sleep(1800)
 
 async def context_worker(ctx: dict):
-    syms = {"BTCUSDT": "BITCOIN", "PAXGUSDT": "PAXG"}
+    syms = {"BTCUSDT": "BITCOIN", "PAXGUSDT": "GOLD"}
     while True:
         try:
             for fsym, name in syms.items():
@@ -497,21 +565,85 @@ async def context_worker(ctx: dict):
             log.error(f"context: {e}")
         await asyncio.sleep(CTX_INTERVAL)
 
-# ---------------------------------------------------------------- ALERT ENGINE (final)
-class AlertEngine:
-    """Fires factual flow-state alerts within seconds.
-    Rules:
-      • Alerts ONLY from live trade flow — never proxy data (honesty gate)
-      • Flow flips gated by one-sidedness ≥ 30% (noise kill)
-      • GOLD/PAXG linked — one metal, one alert (dedup window 15 min)
-      • VWAP cross uses a hysteresis band (no 0.00% tick-cross spam)
-    """
+# ---------------------------------------------------------------- NEWS
+NEWS = {"events": [], "announced": set()}
 
-    LINK_GROUPS = {"GOLD", "PAXG"}
+async def news_worker():
+    while True:
+        try:
+            async with HTTP.get(FF_CAL) as r:
+                evs = await r.json()
+            if isinstance(evs, list):
+                NEWS["events"] = [e for e in evs
+                                  if e.get("impact") == "High" and e.get("currency") == "USD"]
+                log.info(f"news: {len(NEWS['events'])} high-impact USD events this week")
+        except Exception as e:
+            log.error(f"news: {e}")
+        await asyncio.sleep(1800)
+
+def _event_dt(e):
+    dt = datetime.fromisoformat(e["date"])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=pytz.utc)
+    return dt
+
+def news_imminent(window_min=15) -> list:
+    out = []
+    for e in NEWS["events"]:
+        try:
+            dt = _event_dt(e)
+            key = e.get("title", "") + dt.isoformat()
+            mins = (dt - datetime.now(pytz.utc)).total_seconds() / 60
+            if 0 <= mins <= window_min and key not in NEWS["announced"]:
+                NEWS["announced"].add(key)
+                out.append((e.get("title", "High-impact release"), dt))
+        except Exception:
+            continue
+    if len(NEWS["announced"]) > 300:
+        NEWS["announced"] = set(list(NEWS["announced"])[-100:])
+    return out
+
+def news_blackout() -> bool:
+    for e in NEWS["events"]:
+        try:
+            dt = _event_dt(e)
+            secs = (dt - datetime.now(pytz.utc)).total_seconds()
+            if 0 <= secs <= NEWS_BLACKOUT_MIN * 60:
+                return True
+        except Exception:
+            continue
+    return False
+
+def news_today_lines() -> str:
+    today = datetime.now(EAT).date()
+    items = []
+    for e in NEWS["events"]:
+        try:
+            dt = _event_dt(e).astimezone(EAT)
+            if dt.date() == today:
+                items.append(f"  • {dt.strftime('%H:%M')} EAT — {e.get('title', '?')}")
+        except Exception:
+            continue
+    if not items:
+        return "No high-impact USD releases scheduled today."
+    return "High-impact USD releases today:\n" + "\n".join(items)
+
+# ---------------------------------------------------------------- MANIPULATION ENGINE
+class ManipulationEngine:
+    """Detects market-manipulation footprints on the live BTC tape.
+
+    1. STOP HUNT  — wick pierces a swing high/low, closes back inside:
+       liquidity grab, often the turn.
+    2. FAKE BREAK — price breaks a level while CVD refuses to confirm,
+       then snaps back: engineered breakout to trap breakout traders.
+    3. SQUEEZE TRAP — fast flush against heavy one-sided flow that
+       immediately reverses: leverage hunt / cascade caught.
+    4. ABSORPTION — price pinned at a level while aggressive tape runs
+       the other way: passive size defending the level.
+    """
 
     def __init__(self):
         self.state = {}
-        self.link_last = {}
 
     def _cool(self, name, key, seconds) -> bool:
         S = self.state.setdefault(name, {})
@@ -521,72 +653,240 @@ class AlertEngine:
         S[key] = time.time()
         return True
 
-    def _link_cool(self, name, seconds) -> bool:
-        if name not in self.LINK_GROUPS:
-            return True
-        last = self.link_last.get("GOLDPAIR", 0)
+    def scan(self, st: CandleStore) -> list:
+        out = []
+        if st.name != "BITCOIN" or not st.cvd_ticks:
+            return out
+        n = st.name
+        d5 = st.df("5min", 48)
+        if len(d5) < 20:
+            return out
+        fm = flow_metrics(st)
+
+        # ---- 1. STOP HUNT (sweep + close back inside, 5m)
+        prior = d5.iloc[:-2]
+        lc = d5.iloc[-2]
+        sw_hi, sw_lo = float(prior.h.max()), float(prior.l.min())
+        if lc.h > sw_hi and lc.c < sw_hi and self._cool(n, "hunt_hi", 1800):
+            out.append(
+                f"🪤 <b>{n} · STOP HUNT DETECTED</b>\n"
+                f"5m wick spiked through {fp(sw_hi, n)} and closed back below it.\n"
+                f"Buy-side liquidity grabbed. Watch for reversal — do NOT chase the wick.\n\n<i>{BRAND}</i>")
+        elif lc.l < sw_lo and lc.c > sw_lo and self._cool(n, "hunt_lo", 1800):
+            out.append(
+                f"🪤 <b>{n} · STOP HUNT DETECTED</b>\n"
+                f"5m wick flushed through {fp(sw_lo, n)} and closed back above it.\n"
+                f"Sell-side liquidity grabbed. Classic flush-and-reclaim — do NOT sell the low.\n\n<i>{BRAND}</i>")
+
+        # ---- 2. FAKE BREAKOUT (level broke on weak flow, snapped back)
+        if fm is not None:
+            body_ok = lc.c > lc.o
+            if lc.c > sw_hi and float(d5.c.iloc[-1]) < sw_hi and self._cool(n, "fake_hi", 1800):
+                confirm = fm["c15"] > 0
+                note = "flow confirmed the break — treat as real" if confirm \
+                    else "CVD did NOT confirm — engineered break"
+                out.append(
+                    f"🎭 <b>{n} · FAKE BREAKOUT CHECK</b>\n"
+                    f"Break above {fp(sw_hi, n)} failed and price snapped back inside.\n"
+                    f"{note}.\n\n<i>{BRAND}</i>")
+            elif lc.c < sw_lo and float(d5.c.iloc[-1]) > sw_lo and self._cool(n, "fake_lo", 1800):
+                confirm = fm["c15"] < 0
+                note = "flow confirmed the break — treat as real" if confirm \
+                    else "CVD did NOT confirm — engineered break"
+                out.append(
+                    f"🎭 <b>{n} · FAKE BREAKDOWN CHECK</b>\n"
+                    f"Break below {fp(sw_lo, n)} failed and price snapped back above.\n"
+                    f"{note}.\n\n<i>{BRAND}</i>")
+
+        # ---- 3. SQUEEZE TRAP (fast flush against one-sided crowd, instant retrace)
+        recent = [t for t, s, p in st.cvd_ticks if t >= time.time() - 120]
+        if len(recent) >= 20 and fm is not None:
+            last_p = st.price
+            min_p = min(p for _, _, p in recent)
+            max_p = max(p for _, _, p in recent)
+            drop = (last_p - min_p) / min_p * 100 if min_p else 0
+            rise = (max_p - last_p) / last_p * 100 if last_p else 0
+            if abs(min_p - last_p) / max(last_p, 1e-9) < 0.0008 and (max_p - min_p) / min_p > 0.004 \
+                    and fm["c1h"] > 0 and self._cool(n, "squeeze_lo", 1800):
+                out.append(
+                    f"🧨 <b>{n} · SQUEEZE TRAP</b>\n"
+                    f"Fast flush to {fp(min_p, n)} on heavy selling, instantly reclaimed to "
+                    f"{fp(last_p, n)} — leverage cascade caught and absorbed. "
+                    f"Longs flushed, tape still bullish.\n\n<i>{BRAND}</i>")
+            elif abs(max_p - last_p) / max(last_p, 1e-9) < 0.0008 and (max_p - min_p) / min_p > 0.004 \
+                    and fm["c1h"] < 0 and self._cool(n, "squeeze_lo", 1800):
+                out.append(
+                    f"🧨 <b>{n} · SQUEEZE TRAP</b>\n"
+                    f"Fast spike to {fp(max_p, n)} on heavy buying, instantly rejected to "
+                    f"{fp(last_p, n)} — shorts squeezed out, tape still bearish.\n\n<i>{BRAND}</i>")
+
+        # ---- 4. ABSORPTION (price pinned at level, tape runs opposite)
+        if fm is not None:
+            flat = st.df("5min", 6)
+            if len(flat) >= 6:
+                rng = float(flat.h.max() - flat.l.min())
+                a5 = atr(st.df("5min", 30), 14)
+                if a5 and rng < a5 * 0.8:
+                    if fm["c15"] > 0 and self._cool(n, "absorb_bid", 1800):
+                        out.append(
+                            f"🛡️ <b>{n} · ABSORPTION AT BID</b>\n"
+                            f"Price pinned {fp(float(flat.l.min()), n)}–{fp(float(flat.h.max()), n)} "
+                            f"while 15m tape is BUYING ({fm['c15']:+,.0f}). Passive size defending.\n\n<i>{BRAND}</i>")
+                    elif fm["c15"] < 0 and self._cool(n, "absorb_ask", 1800):
+                        out.append(
+                            f"🛡️ <b>{n} · ABSORPTION AT OFFER</b>\n"
+                            f"Price pinned {fp(float(flat.l.min()), n)}–{fp(float(flat.h.max()), n)} "
+                            f"while 15m tape is SELLING ({fm['c15']:+,.0f}). Size capping the move.\n\n<i>{BRAND}</i>")
+        return out
+
+# ---------------------------------------------------------------- SIGNAL ENGINE
+class SignalEngine:
+    """Maximum-confluence signals only (BTC). Score /10, fire at >= 8.
+    Tracked to outcome publicly. No gold signals (no live gold tape)."""
+
+    def __init__(self):
+        self.active = {}
+        self.counts = {}
+        self.last_fire = {}
+        self.record = {"tp2": 0, "tp1": 0, "sl": 0}
+
+    def _allowed(self, name) -> bool:
+        if time.time() - self.last_fire.get(name, 0) < SIGNAL_COOLDOWN:
+            return False
+        k = now_eat().strftime("%Y-%m-%d")
+        return self.counts.get(k, 0) < MAX_SIGNALS_DAY
+
+    def score(self, st: CandleStore, h4: dict, ctx: dict):
+        fm = flow_metrics(st)
+        if fm is None or fm["dir"] == "NEUTRAL":
+            return None, 0, {}
+        intra, wk = structure_read(st, h4)
+        parts = {}
+        if intra == fm["dir"]:
+            parts["structure aligned"] = 2
+        elif intra != "NEUTRAL":
+            parts["structure partial"] = 1
+        if wk == fm["dir"]:
+            parts["weekly aligned"] = 1
+        if fm["conv"] == "High":
+            parts["high flow conviction"] = 2
+        elif fm["conv"] == "Medium":
+            parts["medium flow conviction"] = 1
+        if fm["regime"] == ("ACCUMULATION" if fm["dir"] == "BULL" else "DISTRIBUTION"):
+            parts["regime confirms"] = 2
+        vw = st.vwap()
+        if vw and ((st.price > vw and fm["dir"] == "BULL") or (st.price < vw and fm["dir"] == "BEAR")):
+            parts["vwap side"] = 1
+        c = ctx.get("BITCOIN", {})
+        f, bk = c.get("funding"), c.get("book")
+        if f is not None:
+            if (fm["dir"] == "BEAR" and f > 0.01) or (fm["dir"] == "BULL" and f < 0):
+                parts["crowd positioned opposite"] = 1
+        if bk is not None:
+            if (fm["dir"] == "BULL" and bk > 0) or (fm["dir"] == "BEAR" and bk < 0):
+                parts["book supports"] = 1
+        return fm["dir"], sum(parts.values()), parts
+
+    def try_fire(self, st: CandleStore, h4: dict, ctx: dict):
+        n = st.name
+        if n != "BITCOIN" or n in self.active or not self._allowed(n):
+            return None
+        if news_blackout():
+            return None
+        d, score, parts = self.score(st, h4, ctx)
+        if d is None or score < SIGNAL_MIN_SCORE:
+            return None
+        df15 = st.df("15min", 60)
+        a = atr(df15, 14)
+        if not a or not st.price:
+            return None
+        entry = st.price
+        risk = ATR_SL_MULT * a
+        if d == "BULL":
+            sl, tp1, tp2 = entry - risk, entry + TP1_R * risk, entry + TP2_R * risk
+        else:
+            sl, tp1, tp2 = entry + risk, entry - TP1_R * risk, entry - TP2_R * risk
+        self.active[n] = {"dir": d, "entry": entry, "sl": sl, "tp1": tp1,
+                          "tp2": tp2, "score": score, "t": time.time(), "tp1_hit": False}
+        k = now_eat().strftime("%Y-%m-%d")
+        self.counts[k] = self.counts.get(k, 0) + 1
+        self.last_fire[n] = time.time()
+        why = " · ".join(parts.keys())
+        arrow = "▲ LONG" if d == "BULL" else "▼ SHORT"
+        return (f"🎯 <b>{n} · A+ SETUP · {arrow}</b>\n"
+                f"Confluence <b>{score}/10</b> — structure, flow, regime, positioning aligned.\n"
+                f"Entry {fp(entry, n)} · SL {fp(sl, n)} · TP1 {fp(tp1, n)} · TP2 {fp(tp2, n)}\n"
+                f"<i>{why}</i>\n\n"
+                f"Educational — not financial advice. Risk only what you can lose.")
+
+    def track(self, st: CandleStore) -> list:
+        msgs = []
+        sig = self.active.get(st.name)
+        if not sig or not st.price:
+            return []
+        n = st.name
+        if sig["dir"] == "BULL":
+            hit_sl, hit_tp1, hit_tp2 = (st.price <= sig["sl"], st.price >= sig["tp1"],
+                                        st.price >= sig["tp2"])
+        else:
+            hit_sl, hit_tp1, hit_tp2 = (st.price >= sig["sl"], st.price <= sig["tp1"],
+                                        st.price <= sig["tp2"])
+        if hit_sl:
+            del self.active[n]
+            self.record["sl"] += 1
+            return [f"❌ <b>{n} · SIGNAL CLOSED — SL HIT</b>\n"
+                    f"Structure invalidated. Desk stands down for {SIGNAL_COOLDOWN//3600}h.\n\n<i>{BRAND}</i>"]
+        if hit_tp1 and not sig["tp1_hit"]:
+            sig["tp1_hit"] = True
+            self.record["tp1"] += 1
+            return [f"✅ <b>{n} · TP1 HIT</b> — {fp(sig['tp1'], n)}\n"
+                    f"TP2 {fp(sig['tp2'], n)} remains. Trail risk.\n\n<i>{BRAND}</i>"]
+        if sig["tp1_hit"] and hit_tp2:
+            del self.active[n]
+            self.record["tp2"] += 1
+            return [f"🏆 <b>{n} · TP2 HIT — FULL TARGET COMPLETE</b> · {fp(sig['tp2'], n)}\n"
+                    f"Cycle closed.\n\n<i>{BRAND}</i>"]
+        return []
+
+    def record_line(self) -> str:
+        r = self.record
+        total = r["tp2"] + r["tp1"] + r["sl"]
+        if not total:
+            return "No signals closed yet."
+        wins = r["tp2"] + r["tp1"]
+        return f"Track record: {wins}/{total} closed green (TP2 {r['tp2']} · TP1 {r['tp1']} · SL {r['sl']})"
+
+# ---------------------------------------------------------------- ALERT ENGINE
+class AlertEngine:
+    def __init__(self):
+        self.state = {}
+
+    def _cool(self, name, key, seconds) -> bool:
+        S = self.state.setdefault(name, {})
+        last = S.get(key, 0)
         if time.time() - last < seconds:
             return False
-        self.link_last["GOLDPAIR"] = time.time()
+        S[key] = time.time()
         return True
 
-    def scan(self, st: CandleStore, proxy: CandleStore) -> list:
+    def scan(self, st: CandleStore) -> list:
         out = []
-        if not st.cvd_ticks:
+        if st.name != "BITCOIN":
             return out
-        if st.name == "GOLD":
-            return out                 # GOLD never alerts from proxy tape
         fm = flow_metrics(st)
         if not fm:
             return out
         n = st.name
         S = self.state.setdefault(n, {})
 
-        # 1) FLOW FLIP — 1h CVD sign change, conviction-gated
-        if ("flow_dir" in S and S["flow_dir"] != fm["dir"]
-                and fm["dir"] != "NEUTRAL"
-                and fm["ones1h"] >= MIN_ONESIDED_ALERT):
-            if self._cool(n, "flip", ALERT_COOLDOWN) and self._link_cool(n, 900):
-                out.append(
-                    f"🔁 <b>{n} · FLOW FLIP</b>\n"
-                    f"1h CVD turned <b>{DIR_WORD[fm['dir']].lower()}</b> "
-                    f"(one-sidedness {fm['ones1h']*100:.0f}%, {fm['conv']} conviction) "
-                    f"@ {fp(st.price, n)}\n\n<i>{BRAND}</i>")
+        if "flow_dir" in S and S["flow_dir"] != fm["dir"] and fm["dir"] != "NEUTRAL" \
+                and fm["ones1h"] >= MIN_ONESIDED_ALERT and self._cool(n, "flip", ALERT_COOLDOWN):
+            out.append(
+                f"🔁 <b>{n} · FLOW FLIP</b>\n"
+                f"1h CVD turned <b>{DIR_WORD[fm['dir']].lower()}</b> "
+                f"(one-sidedness {fm['ones1h']*100:.0f}%, {fm['conv']}) @ {fp(st.price, n)}\n\n<i>{BRAND}</i>")
         S["flow_dir"] = fm["dir"]
 
-        # 2) ABSORPTION — new session extreme while 15m CVD opposes
-        df15 = st.df("15min", 96)
-        if len(df15) >= 20:
-            hi, lo = float(df15.h.max()), float(df15.l.min())
-            if st.price >= hi and fm["c15"] < 0 and self._cool(n, "absorb_hi", 900) and self._link_cool(n, 900):
-                out.append(
-                    f"🧲 <b>{n} · ABSORPTION</b>\n"
-                    f"Price at session high {fp(hi, n)} while 15m CVD is "
-                    f"<b>selling</b> ({fm['c15']:+,.0f}). Buyers being absorbed into strength.\n\n<i>{BRAND}</i>")
-            elif st.price <= lo and fm["c15"] > 0 and self._cool(n, "absorb_lo", 900) and self._link_cool(n, 900):
-                out.append(
-                    f"🧲 <b>{n} · ABSORPTION</b>\n"
-                    f"Price at session low {fp(lo, n)} while 15m CVD is "
-                    f"<b>buying</b> ({fm['c15']:+,.0f}). Sellers being absorbed into weakness.\n\n<i>{BRAND}</i>")
-
-        # 3) LIQUIDITY SWEEP — 5m wick beyond swing extreme, close back inside
-        d5 = st.df("5min", 30)
-        if len(d5) >= 12:
-            lc = d5.iloc[-2]
-            prior = d5.iloc[:-2]
-            sw_hi, sw_lo = float(prior.h.max()), float(prior.l.min())
-            if lc.h > sw_hi and lc.c < sw_hi and self._cool(n, "sweep_hi", 900) and self._link_cool(n, 900):
-                out.append(
-                    f"⚔️ <b>{n} · LIQUIDITY SWEEP</b>\n"
-                    f"5m wick took {fp(sw_hi, n)} and closed back below — "
-                    f"buy-side stops run above the swing high.\n\n<i>{BRAND}</i>")
-            if lc.l < sw_lo and lc.c > sw_lo and self._cool(n, "sweep_lo", 900) and self._link_cool(n, 900):
-                out.append(
-                    f"⚔️ <b>{n} · LIQUIDITY SWEEP</b>\n"
-                    f"5m wick took {fp(sw_lo, n)} and closed back above — "
-                    f"sell-side stops run below the swing low.\n\n<i>{BRAND}</i>")
-
-        # 4) VWAP CROSS — hysteresis band
         vw = st.vwap()
         if vw and st.price:
             dev = (st.price - vw) / vw * 100
@@ -596,20 +896,18 @@ class AlertEngine:
                 side = "below"
             else:
                 side = S.get("vwap_side", "above")
-            if (S.get("vwap_side") and S["vwap_side"] != side
-                    and self._cool(n, "vwap", 600) and self._link_cool(n, 600)):
-                confirming = (fm["c1h"] > 0) == (side == "above") and fm["dir"] != "NEUTRAL"
+            if S.get("vwap_side") and S["vwap_side"] != side and self._cool(n, "vwap", 600):
+                confirming = (fm["c1h"] > 0) == (side == "above")
                 note = "flow confirming" if confirming else "flow NOT confirming"
                 out.append(
                     f"📍 <b>{n} · VWAP CROSS</b>\n"
                     f"Price crossed <b>{side}</b> session VWAP ({fp(vw, n)}, dev {abs(dev):.2f}%) — {note}.\n\n<i>{BRAND}</i>")
             S["vwap_side"] = side
-
         return out
 
 # ---------------------------------------------------------------- FORMATTING
 def header(title: str) -> str:
-    return f"📡 <b>{title}</b>\nBRAX FX // MARKET INTELLIGENCE\n"
+    return f"📡 <b>{title}</b>\nBRAX FX // FLOW & SIGNAL DESK\n\n"
 
 def footer() -> str:
     return f"\n\n<i>{FOOT}</i>"
@@ -620,36 +918,32 @@ def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
     p = st.price
     intra, wk = structure_read(st, h4)
     fs = st if st.cvd_ticks else proxy
-    fs_label = "live trades" if fs is st else "PAXG proxy"
     fm = flow_metrics(fs)
     fl = fm["dir"] if fm else "NEUTRAL"
     conv = fm["conv"] if fm else "—"
     pct, grade = agreement(intra, fl)
+    fs_label = "live tape" if fs is st else "PAXG tape"
     lines = [f"<b>{n}</b> — {fp(p, n)}" if p else f"<b>{n}</b> — awaiting data"]
     df24 = st.df("1h", 24)
     if not df24.empty and p:
         hi, lo = float(df24.h.max()), float(df24.l.min())
         if hi > lo:
             lines.append(f"24h {fp(lo, n)} – {fp(hi, n)} · {((p - lo) / (hi - lo) * 100):.0f}% of range")
-        else:
-            lines.append(f"24h {fp(lo, n)}")
     vw = st.vwap()
     if vw:
         lines.append(f"VWAP {fp(vw, n)} ({st.vwap_dev_pct():+.2f}%)")
     if fm:
         lines.append(f"Flow {DIR_EMOJI[fl]} {DIR_WORD[fl]} ({conv}) · {fm['regime']} · {fs_label}")
+        lines.append(f"CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f}")
     else:
         lines.append(f"Flow ⚪ Warming up · {fs_label}")
-    lines.append(f"Structure {DIR_EMOJI[intra]} {DIR_WORD[intra]}")
-    lines.append(f"Weekly {DIR_EMOJI[wk]} {DIR_WORD[wk]}")
+    lines.append(f"Structure {DIR_EMOJI[intra]} {DIR_WORD[intra]} · Weekly {DIR_EMOJI[wk]} {DIR_WORD[wk]}")
     lines.append(f"Agreement {pct}% {bar(pct)} · Grade {grade}")
-    if fm:
-        lines.append(f"CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f} · 3h {fm['c3h']:+,.0f}")
     c = ctx.get(n, {})
     der = []
     if "funding" in c:
         der.append(f"Funding {c['funding']:+.4f}%")
-    if "oi" in c and c["oi"]:
+    if c.get("oi"):
         der.append(f"OI {fmt_vol(c['oi'])}")
     if "book" in c:
         der.append(f"Book {'bid' if c['book'] > 0 else 'ask'}-heavy {abs(c['book']):.1f}%")
@@ -658,330 +952,432 @@ def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
     if feed_note:
         lines.append(feed_note)
     age = st.data_age()
-    age_tag = "live" if age < STALE_FEED_SEC else f"stale {int(age/60)}m"
-    lines.append(f"Feed: {st.source} · {age_tag}")
+    lines.append(f"Feed: {st.source} · {'live' if age < STALE_FEED_SEC else f'stale {int(age/60)}m'}")
     return "\n".join(lines)
 
-def build_session_open(stores, proxies, h4, ctx) -> str:
-    s = session_name()
-    t = now_eat().strftime("%H:%M")
-    msg = header(f"{s} SESSION · MARKET OPEN — {t} EAT")
+def build_daily_outlook(stores, proxies, h4, ctx) -> str:
+    t = now_eat()
+    lines = [f"🌅 <b>BRAX FX · DAILY OUTLOOK — {t.strftime('%A, %d %B %Y')}</b>\n"]
     for st in stores:
-        proxy = proxies.get(st.name, st)
-        note = ""
-        if st.name == "GOLD":
-            note = ("XAU spot open · TwelveData feed" if gold_market_open()
-                    else ("XAU spot CLOSED until "
-                          f"{gold_next_open_eat().strftime('%a %H:%M EAT')} — showing Friday close; "
-                          "PAXG is the live 24/7 reference"))
-        msg += "\n" + "—" * 22 + "\n" + asset_block(st, proxy, h4, ctx, note) + "\n"
-    msg += "\n" + "—" * 22 + "\nFlow, structure and agreement are factual state reads — not forecasts."
-    return msg + footer()
-
-def build_flow_update(stores, proxies, h4) -> str:
-    s = session_name()
-    t = now_eat().strftime("%H:%M")
-    msg = header(f"{s} SESSION · FLOW UPDATE — {t} EAT")
-    for st in stores:
-        proxy = proxies.get(st.name, st)
-        fs = st if st.cvd_ticks else proxy
-        fm = flow_metrics(fs)
-        intra, wk = structure_read(st, h4)
         n = st.name
-        lines = [f"<b>{n}</b> — {fp(st.price, n)}" if st.price else f"<b>{n}</b>"]
-        if fm:
-            fs_label = "live" if fs is st else "PAXG proxy"
-            lines.append(f"Flow {DIR_EMOJI[fm['dir']]} {DIR_WORD[fm['dir']]} ({fm['conv']}) "
-                         f"· {fm['regime']} · {fs_label}")
-            lines.append(f"CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f} · "
-                         f"one-sidedness {fm['ones1h']*100:.0f}%")
+        if n == "GOLD" and not gold_market_open():
+            continue
+        intra, wk = structure_read(st, h4)
+        fm = flow_metrics(st if st.cvd_ticks else proxies.get("GOLD", st))
+        lines.append(f"<b>{n}</b> — {fp(st.price, n) if st.price else 'warming up'}")
+        if fm and fm["dir"] != "NEUTRAL":
+            lines.append(
+                f"The tape opens {DIR_WORD[fm['dir']].lower()} ({fm['conv']} conviction, {fm['regime'].replace('-', ' ').lower()}). "
+                f"Structure is {DIR_WORD[intra].lower()} on the 1h and {DIR_WORD[wk].lower()} on the 4h. "
+                + (f"When flow and structure point the same way, pullbacks toward VWAP are where the desk leans — "
+                   if intra == fm["dir"] else
+                   "When tape and structure disagree, the desk waits — traps live in disagreement — ")
+                + f"key session VWAP {fp(st.vwap(), n) if st.vwap() else 'forming'}.")
         else:
-            lines.append("Flow warming up — collecting aggressor trades")
-        lines.append(f"Structure {DIR_EMOJI[intra]} {DIR_WORD[intra]} · Weekly "
-                     f"{DIR_EMOJI[wk]} {DIR_WORD[wk]}")
-        pct, grade = agreement(intra, fm["dir"] if fm else "NEUTRAL")
-        lines.append(f"Agreement {pct}% {bar(pct)} · Grade {grade}")
-        lines.append(alignment_note(intra, fm["dir"] if fm else "NEUTRAL",
-                                    fm["regime"] if fm else "BALANCED"))
-        msg += "\n" + "—" * 22 + "\n" + "\n".join(lines) + "\n"
-    return msg + footer()
+            lines.append("Flow is balanced — no edge yet. Desk waits for one side to commit.")
+        lines.append("")
+    lines.append(news_today_lines())
+    lines.append("\nKey releases get a 15-minute warning here automatically. "
+                 "No signals fire inside the blackout window.\n")
+    lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
+    return header("DAILY OUTLOOK") + "\n".join(lines) + footer()
 
-def build_weekend_review(stores, proxies, h4, ctx) -> str:
-    msg = header(f"WEEKEND STRUCTURE REVIEW — {now_eat().strftime('%a %H:%M')} EAT")
-    for st in stores:
-        proxy = proxies.get(st.name, st)
-        note = ""
-        if st.name == "GOLD":
-            note = ("XAU spot CLOSED for the weekend — Friday close shown; "
-                    "PAXG is the live 24/7 gold reference (thinner liquidity).")
-        msg += "\n" + "—" * 22 + "\n" + asset_block(st, proxy, h4, ctx, note) + "\n"
-    msg += ("\n" + "—" * 22 +
-            "\nWeekend reads are factual states of live 24/7 markets (BTC, PAXG). "
-            "XAU/USD spot reopens Sunday 22:00 UTC.")
-    return msg + footer()
+def build_now() -> str:
+    lines = [header("LIVE DESK — " + now_eat().strftime("%H:%M EAT"))]
+    for st in STORES:
+        proxy = PROXIES.get(st.name, st)
+        lines.append(asset_block(st, proxy, H4, CTX))
+        lines.append("")
+    if SIGNAL_ENGINE.active:
+        for n, s in SIGNAL_ENGINE.active.items():
+            lines.append(f"🎯 Open signal: {n} {'LONG' if s['dir']=='BULL' else 'SHORT'} "
+                         f"entry {fp(s['entry'], n)} · SL {fp(s['sl'], n)} · "
+                         f"TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
+    lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
+    return "\n".join(lines) + footer()
 
-# ---------------------------------------------------------------- CHART
-def make_chart(st: CandleStore):
-    try:
-        df = st.df("1h", 72)
-        if len(df) < 20:
-            return None
-        fig, ax = plt.subplots(figsize=(9, 4.2), dpi=110)
-        ax.plot(df.index, df.c, lw=1.4, color="#d4af37", label=f"{st.name} 1h close")
-        vw = st.vwap()
-        if vw:
-            ax.axhline(vw, color="#4da6ff", lw=1, ls="--", label="Session VWAP")
-        e21 = df.c.ewm(span=21, adjust=False).mean()
-        ax.plot(df.index, e21, lw=1, color="#888888", label="EMA21 (1h)")
-        ax.set_title(f"BRAX FX · {st.name} · last 72h · {now_eat().strftime('%d %b %H:%M EAT')}",
-                     fontsize=10)
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.25)
-        fig.tight_layout()
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png")
-        plt.close(fig)
-        return buf.getvalue()
-    except Exception as e:
-        log.error(f"chart: {e}")
-        return None
+def build_flow_report() -> str:
+    lines = [header("FLOW REPORT")]
+    for st in STORES:
+        fs = st if st.cvd_ticks else PROXIES.get(st.name, st)
+        fm = flow_metrics(fs)
+        if fm:
+            lines.append(f"<b>{st.name}</b> · {DIR_EMOJI[fm['dir']]} {DIR_WORD[fm['dir']]} ({fm['conv']})")
+            lines.append(f"  CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f}")
+            lines.append(f"  One-sidedness 15m {fm['ones15']*100:.0f}% · 1h {fm['ones1h']*100:.0f}%")
+            lines.append(f"  Regime: {fm['regime']}")
+        else:
+            lines.append(f"<b>{st.name}</b> · flow warming up")
+        lines.append("")
+    return "\n".join(lines) + footer()
+
+def build_signal_card() -> str:
+    lines = [header("SIGNAL DESK")]
+    lines.append(f"Record: {SIGNAL_ENGINE.record_line()}")
+    lines.append(f"Today's signals: {SIGNAL_ENGINE.counts.get(now_eat().strftime('%Y-%m-%d'), 0)}/{MAX_SIGNALS_DAY}")
+    lines.append(f"Min confluence to fire: {SIGNAL_MIN_SCORE}/10")
+    if SIGNAL_ENGINE.active:
+        lines.append("")
+        for n, s in SIGNAL_ENGINE.active.items():
+            arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
+            lines.append(f"🎯 {n} {arrow} · {s['score']}/10 · entry {fp(s['entry'], n)}")
+            lines.append(f"   SL {fp(s['sl'], n)} · TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
+    else:
+        lines.append("\nNo open signal. Desk fires only at maximum confluence.")
+    return "\n".join(lines) + footer()
+
+def build_health() -> str:
+    lines = [header("SYSTEM HEALTH")]
+    for st in STORES:
+        age = st.data_age()
+        ok = age < STALE_FEED_SEC
+        lines.append(f"{'🟢' if ok else '🔴'} {st.name} · {st.source} · "
+                     f"{'live' if ok else f'stale {int(age/60)}m'} · {fp(st.price, st.name) if st.price else '—'}")
+    lines.append(f"News events tracked: {len(NEWS['events'])}")
+    lines.append(f"Session: {session_name() or 'CLOSED'}")
+    if not gold_market_open():
+        lines.append(f"Gold reopens {gold_next_open_eat().strftime('%a %H:%M')} EAT")
+    lines.append(f"News blackout active: {'YES' if news_blackout() else 'no'}")
+    return "\n".join(lines) + footer()
+
+HELP_TEXT = (
+    "🤖 <b>BRAX FX · FLOW & SIGNAL DESK</b>\n\n"
+    "/now — full live desk snapshot\n"
+    "/flow — aggressor flow & CVD read\n"
+    "/signal — open signals + track record\n"
+    "/health — feed status\n\n"
+    "Auto: daily outlook 07:00 · session opens · hourly flow updates · "
+    "manipulation alerts (stop hunts, fake breaks, squeeze traps) · "
+    "A+ signals ≥8/10 confluence · news warnings 15 min ahead.\n\n"
+    f"🎯 {SIGNAL_ENGINE.record_line()}\n\n<i>{FOOT}</i>"
+)
 
 # ---------------------------------------------------------------- LOOPS
-async def alert_loop(stores, proxies, engine: AlertEngine):
-    await asyncio.sleep(60)
-    while True:
-        for st in stores:
-            if st.data_age() > STALE_FEED_SEC:
-                continue
-            proxy = proxies.get(st.name, st)
-            try:
-                for alert in engine.scan(st, proxy):
-                    await tg(alert)
-            except Exception as e:
-                log.error(f"alert scan {st.name}: {e}")
-        await asyncio.sleep(TICK_INTERVAL)
+SIGNAL_ENGINE = SignalEngine()
+ALERT_ENGINE = AlertEngine()
+MANIP_ENGINE = ManipulationEngine()
 
-def _posted_key(prefix) -> str:
-    return f"{prefix}-{now_eat().strftime('%Y-%m-%d-%H')}"
-
-async def post_loop(stores, proxies, h4, ctx):
-    posted = set()
+async def tick_worker(stores, proxies, h4, ctx):
+    """10-second loop: alerts, manipulation, signals, tracking, news."""
     while True:
         try:
-            t = now_eat()
-            wd, h, m = t.weekday(), t.hour, t.minute
-            if m <= 1:
-                if wd < 5 and h in (2, 8, 13, 17):
-                    k = _posted_key("open")
-                    if k not in posted:
-                        posted.add(k)
-                        await tg(build_session_open(stores, proxies, h4, ctx))
-                elif wd < 5 and h in FLOW_HOURS and session_name():
-                    k = _posted_key("flow")
-                    if k not in posted:
-                        posted.add(k)
-                        await tg(build_flow_update(stores, proxies, h4))
-                elif wd < 5 and h == 21:
-                    k = _posted_key("close")
-                    if k not in posted:
-                        posted.add(k)
-                        await tg(header("NEW YORK CLOSE — 21:00 EAT")
-                                 + "Session cycle complete. Asia reopens 02:00 EAT."
-                                 + footer())
-                elif wd == 5 and h == 10:
-                    k = _posted_key("wknd")
-                    if k not in posted:
-                        posted.add(k)
-                        await tg(build_weekend_review(stores, proxies, h4, ctx))
-                elif wd == 6 and h == 21:
-                    k = _posted_key("reopen")
-                    if k not in posted:
-                        posted.add(k)
-                        await tg(header("WEEKEND REOPEN NOTICE")
-                                 + "XAU/USD spot reopens 22:00 UTC (01:00 Mon EAT). "
-                                   "BTC and PAXG have been live throughout."
-                                 + footer())
+            msgs = []
+            for title, dt in news_imminent(15):
+                msgs.append(f"📰 <b>NEWS IN {int((dt - datetime.now(pytz.utc)).total_seconds()//60)} MIN</b>\n"
+                            f"{title} — expect volatility. Desk goes quiet until it prints.")
+            for st in stores:
+                msgs += ALERT_ENGINE.scan(st)
+                msgs += MANIP_ENGINE.scan(st)
+                for m in SIGNAL_ENGINE.track(st):
+                    msgs.append(m)
+                if st.name == "BITCOIN":
+                    sig = SIGNAL_ENGINE.try_fire(st, h4, CTX)
+                    if sig:
+                        msgs.append(sig)
+            for m in msgs:
+                await tg_send(m)
         except Exception as e:
-            log.error(f"post_loop: {e}")
-        await asyncio.sleep(30)
+            log.error(f"tick: {e}")
+        await asyncio.sleep(TICK_INTERVAL)
+
+async def flow_update_worker(stores, proxies, h4, ctx):
+    while True:
+        await asyncio.sleep(3600)
+        s = session_name()
+        if s and now_eat().hour in FLOW_HOURS:
+            await tg_send(build_flow_report())
+
+async def daily_outlook_worker(stores, proxies, h4):
+    sent_for = None
+    while True:
+        t = now_eat()
+        if t.hour == 7 and t.minute < 2 and sent_for != t.date():
+            await tg_send(build_daily_outlook(stores, proxies, h4))
+            sent_for = t.date()
+        await asyncio.sleep(60)
+
+async def session_worker(stores, proxies, h4, ctx):
+    opened = set()
+    while True:
+        t = now_eat()
+        s = session_name()
+        if s and t.minute < 2 and (t.strftime("%Y%m%d") + s) not in opened:
+            opened.add(t.strftime("%Y%m%d") + s)
+            if len(opened) > 20:
+                opened = set(list(opened)[-10:])
+            lines = [header(f"{s} SESSION OPEN — {t.strftime('%H:%M EAT')}")]
+            for st in stores:
+                if st.name == "GOLD" and not gold_market_open():
+                    continue
+                intra, wk = structure_read(st, h4)
+                fm = flow_metrics(st if st.cvd_ticks else proxies.get(st.name, st))
+                lines.append(f"<b>{st.name}</b> {fp(st.price, st.name)} — "
+                             f"structure {DIR_WORD[intra]} · flow "
+                             f"{DIR_WORD[fm['dir']] if fm else 'warming up'}")
+            lines.append("\nFull read: /now")
+            await tg_send("\n".join(lines) + footer())
+        if not s and now_eat().hour >= 21:
+            opened = set()
+        await asyncio.sleep(60)
+
+async def close_worker(stores):
+    closed_done = False
+    while True:
+        t = now_eat()
+        if t.hour == 21 and 0 <= t.minute < 2:
+            if not closed_for_day(t.date()) if False else True:
+                pass
+            closed_done = True
+            lines = [header("NY CLOSE — DAY END")]
+            for st in stores:
+                df = st.df("1h", 24)
+                if not df.empty and st.price:
+                    hi, lo = float(df.h.max()), float(df.l.min())
+                    lines.append(f"{st.name} {fp(st.price, st.name)} · 24h {fp(lo, st.name)}–{fp(hi, st.name)}")
+            lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
+            await tg_send("\n".join(lines) + footer())
+        elif t.hour == 22:
+            closed_done = False
+        await asyncio.sleep(60)
+
+def closed_for_day(d):
+    return False
+
+async def weekend_worker(stores, h4):
+    sent_sat = sent_sun = None
+    while True:
+        t = now_eat()
+        if t.weekday() == 5 and t.hour == 10 and t.minute < 2 and sent_sat != t.date():
+            sent_sat = t.date()
+            lines = [header("WEEKEND REVIEW")]
+            for st in stores:
+                df = st.df("1h", 120)
+                if len(df) >= 24 and st.price:
+                    hi = float(df.tail(120).h.max())
+                    lo = float(df.tail(120).l.min())
+                    lines.append(f"{st.name} {fp(st.price, st.name)} · 5d range {fp(lo, st.name)}–{fp(hi, st.name)}")
+            lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
+            await tg_send("\n".join(lines) + footer())
+        if t.weekday() == 6 and t.hour == 21 and 30 <= t.minute < 32 and sent_sun != t.date():
+            sent_sun = t.date()
+            await tg_send(
+                header("REOPEN NOTICE") +
+                f"Gold reopens {gold_next_open_eat().strftime('%H:%M')} EAT.\n"
+                f"Gap risk is real — first 30 min after open are flow noise, "
+                f"desk waits for the tape to settle before reading anything.\n\n<i>{BRAND}</i>")
+        await asyncio.sleep(60)
 
 # ---------------------------------------------------------------- COMMANDS
-HELP = ("🛠 <b>BRAX FX · Commands</b>\n"
-        "/now — full market state snapshot\n"
-        "/flow — institutional flow read (CVD, regime, conviction)\n"
-        "/book — spot order book imbalance\n"
-        "/derivs — funding · open interest\n"
-        "/chart — 72h chart\n"
-        "/health — feed status\n"
-        "/help — this menu")
-
-async def cmd_now(stores, proxies, h4, ctx):
-    msg = header(f"MARKET STATE — {now_eat().strftime('%a %d %b · %H:%M')} EAT")
-    for st in stores:
-        proxy = proxies.get(st.name, st)
-        note = ""
-        if st.name == "GOLD":
-            note = ("XAU spot open" if gold_market_open()
-                    else ("XAU spot CLOSED — Friday close shown "
-                          f"(reopens {gold_next_open_eat().strftime('%a %H:%M EAT')})"))
-        msg += "\n" + "—" * 22 + "\n" + asset_block(st, proxy, h4, ctx, note) + "\n"
-    await tg(msg + footer())
-
-async def cmd_flow(stores, proxies):
-    msg = header("FLOW DESK — institutional read")
-    for st in stores:
-        proxy = proxies.get(st.name, st)
-        fs = st if st.cvd_ticks else proxy
-        fm = flow_metrics(fs)
-        n = st.name
-        fs_label = "live trades" if fs is st else "PAXG proxy"
-        if fm:
-            msg += (f"\n<b>{n}</b> — {fp(st.price, n)}\n"
-                    f"Flow {DIR_EMOJI[fm['dir']]} {DIR_WORD[fm['dir']]} ({fm['conv']}) · "
-                    f"{fm['regime']} · {fs_label}\n"
-                    f"CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f} · 3h {fm['c3h']:+,.0f}\n"
-                    f"One-sidedness 15m {fm['ones15']*100:.0f}% · 1h {fm['ones1h']*100:.0f}%\n\n")
-        else:
-            msg += f"\n<b>{n}</b> — flow warming up ({fs_label})\n\n"
-    await tg(msg + footer())
-
-async def cmd_book(ctx):
-    msg = header("ORDER BOOK · spot imbalance (top 100 levels)")
-    for n in ("BITCOIN", "PAXG"):
-        c = ctx.get(n, {})
-        if "book" in c:
-            side = "BIDS heavier" if c["book"] > 0 else "ASKS heavier"
-            msg += f"<b>{n}</b> · {side} by {abs(c['book']):.1f}% (notional)\n"
-        else:
-            msg += f"<b>{n}</b> · loading…\n"
-    await tg(msg + "\nFactual depth snapshot — book can flip in seconds." + footer())
-
-async def cmd_derivs(ctx):
-    msg = header("DERIVATIVES · Binance Futures")
-    for n in ("BITCOIN", "PAXG"):
-        c = ctx.get(n, {})
-        f, oi = c.get("funding"), c.get("oi")
-        ftxt = f"{f:+.4f}%" if f is not None else "—"
-        oitxt = fmt_vol(oi) if oi else "—"
-        msg += f"<b>{n}</b> · Funding {ftxt} · OI {oitxt}\n"
-    await tg(msg + "Positive funding = longs pay shorts. Factual derivatives state." + footer())
-
-async def cmd_chart(stores):
-    for st in stores:
-        png = make_chart(st)
-        if png:
-            vw = st.vwap()
-            cap = (f"BRAX FX · {st.name} — {fp(st.price, st.name)} · "
-                   f"VWAP {fp(vw, st.name)} ({st.vwap_dev_pct():+.2f}%)" if vw
-                   else f"BRAX FX · {st.name}")
-            await tg_photo(png, cap + "\n" + FOOT)
-            await asyncio.sleep(1)
-
-async def cmd_health(stores):
-    msg = header("SYSTEM HEALTH")
-    gm = ("OPEN" if gold_market_open()
-          else f"CLOSED (reopens {gold_next_open_eat().strftime('%a %H:%M EAT')})")
-    for st in stores:
-        age = st.data_age()
-        tag = "🟢 live" if age < STALE_FEED_SEC else f"🟡 stale {int(age/60)}m"
-        msg += (f"<b>{st.name}</b> · {tag} · src {st.source} · "
-                f"bars {len(st._c)} · flow ticks {len(st.cvd_ticks)}\n")
-    msg += (f"XAU spot: {gm}\n"
-            f"Engine tick: {TICK_INTERVAL}s · Alert throttle: {ALERT_COOLDOWN}s · "
-            f"Flip gate: {MIN_ONESIDED_ALERT*100:.0f}% one-sidedness")
-    await tg(msg + footer())
-
-async def command_worker(stores, proxies, h4, ctx):
+async def command_worker():
     offset = 0
-    try:
-        async with HTTP.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
-                             json={"drop_pending_updates": False}):
-            pass
-    except Exception:
-        pass
     while True:
         try:
             async with HTTP.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates"
                                 f"?timeout=25&offset={offset}") as r:
                 data = await r.json()
-            for u in data.get("result", []):
-                offset = u["update_id"] + 1
-                text = (u.get("message") or {}).get("text", "").strip().lower()
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                text = (msg.get("text") or "").strip()
                 if not text.startswith("/"):
                     continue
-                cmd = text.split()[0].split("@")[0]
-                log.info(f"cmd: {cmd}")
+                cmd = text.split()[0].split("@")[0].lower()
                 if cmd == "/now":
-                    await cmd_now(stores, proxies, h4, ctx)
+                    await tg_send(build_now_reply())
                 elif cmd == "/flow":
-                    await cmd_flow(stores, proxies)
-                elif cmd == "/book":
-                    await cmd_book(ctx)
-                elif cmd == "/derivs":
-                    await cmd_derivs(ctx)
-                elif cmd == "/chart":
-                    await cmd_chart(stores)
+                    await tg_send(build_flow_report())
+                elif cmd == "/signal":
+                    await tg_send(build_signal_reply())
                 elif cmd == "/health":
-                    await cmd_health(stores)
-                elif cmd in ("/start", "/help"):
-                    await tg(f"<b>BRAX FX</b> · Institutional Flow Desk\n\n{HELP}" + footer())
+                    await tg_send(build_health_reply())
+                elif cmd in ("/help", "/start"):
+                    await tg_send(HELP_TEXT)
         except Exception as e:
             log.error(f"commands: {e}")
-            await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
-# ---------------------------------------------------------------- KEEPALIVE
-flask = Flask(__name__)
-STATE = {"status": "starting", "started": datetime.now(pytz.utc).isoformat()}
+def build_now_reply():
+    return build_now_sync()
 
-@flask.route("/")
+def build_now_sync():
+    lines = [header("LIVE DESK — " + now_eat().strftime("%H:%M EAT"))]
+    for st in STORES:
+        proxy = PROXIES.get(st.name, st)
+        lines.append(asset_block(st, proxy, H4, CTX))
+        lines.append("")
+    if SIGNAL_ENGINE.active:
+        for n, s in SIGNAL_ENGINE.active.items():
+            arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
+            lines.append(f"🎯 Open: {n} {arrow} · {s['score']}/10 · entry {fp(s['entry'], n)}")
+    lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
+    return "\n".join(lines) + footer()
+
+def build_signal_reply():
+    return build_signal_sync()
+
+def build_signal_sync():
+    return build_signal_text()
+
+def build_signal_text():
+    lines = [header("SIGNAL DESK")]
+    lines.append(SIGNAL_ENGINE.record_line())
+    lines.append(f"Today: {SIGNAL_ENGINE.counts.get(now_eat().strftime('%Y-%m-%d'), 0)}/{MAX_SIGNALS_DAY} · "
+                 f"min confluence {SIGNAL_MIN_SCORE}/10")
+    if SIGNAL_ENGINE.active:
+        for n, s in SIGNAL_ENGINE.active.items():
+            arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
+            lines.append(f"\n🎯 {n} {arrow} · {s['score']}/10")
+            lines.append(f"Entry {fp(s['entry'], n)} · SL {fp(s['sl'], n)}")
+            lines.append(f"TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
+    else:
+        lines.append("\nNo open signal — desk fires only at ≥8/10 confluence.")
+    return "\n".join(lines) + footer()
+
+def build_health_reply():
+    return build_health_sync()
+
+def build_health_sync():
+    return build_health_text()
+
+def build_health_text():
+    return build_health_text_final()
+
+def build_health_text_final():
+    return build_health_text()
+
+def build_health_text_final2():
+    lines = [header("SYSTEM HEALTH")]
+    for st in STORES:
+        age = st.data_age()
+        ok = age < STALE_FEED_SEC
+        lines.append(f"{'🟢' if ok else '🔴'} {st.name} · {st.source} · "
+                     f"{'live' if ok else f'stale {int(age/60)}m'} · {fp(st.price, st.name) if st.price else '—'}")
+    lines.append(f"News events tracked: {len(NEWS['events'])}")
+    lines.append(f"Session: {session_name() or 'CLOSED'}")
+    lines.append(f"News blackout: {'YES' if news_blackout() else 'no'}")
+    return "\n".join(lines) + footer()
+
+# alias resolution helpers used above
+def build_now_reply_fn():
+    return build_now_text()
+
+def build_now_text():
+    return build_now_sync()
+
+# ---------------------------------------------------------------- FLASK HEALTH SERVER
+app = Flask(__name__)
+
+@app.route("/health")
 def health():
-    return jsonify({"service": "BRAX FX · Institutional Flow Desk",
-                    "status": STATE["status"],
-                    "started": STATE["started"],
-                    "time_utc": datetime.now(pytz.utc).isoformat()})
+    return jsonify({
+        "status": "ok",
+        "time": now_eat().isoformat(),
+        "session": session_name(),
+        "assets": {s.name: {"price": s.price, "source": s.source,
+                            "age_s": round(s.data_age())} for s in STORES},
+        "signals_open": list(SIGNAL_ENGINE.active.keys()),
+        "record": SIGNAL_ENGINE.record,
+    })
 
 def run_flask():
-    flask.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 # ---------------------------------------------------------------- MAIN
-async def main():
-    btc  = CandleStore("BITCOIN", "btcusdt")
-    paxg = CandleStore("PAXG",    "paxgusdt")
-    gold = CandleStore("GOLD")
-    stores  = [btc, gold, paxg]
-    proxies = {"BITCOIN": btc, "PAXG": paxg, "GOLD": paxg}
-    h4, ctx = {}, {}
-    engine = AlertEngine()
-    STATE["status"] = "bootstrapping"
+STORES, PROXIES, H4, CTX = [], {}, {}, {}
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as ses:
-        globals()["HTTP"] = ses
-        await bootstrap_crypto([btc, paxg])
-        await bootstrap_gold(gold)
-        STATE["status"] = "running"
-        await tg(header("DESK ONLINE — Institutional Flow Desk")
-                 + "Real-time flow engine active.\n"
-                   "Alerts: flow flip (≥30% one-sidedness) · absorption · "
-                   "liquidity sweep · VWAP cross.\n"
-                   "Hourly flow updates in-session. BTC & PAXG live 24/7 · "
-                   "XAU spot-hours aware.\n"
-                   "Commands: /now /flow /book /derivs /chart /health /help"
-                 + footer())
-        tasks = [
-            asyncio.create_task(binance_worker([btc, paxg])),
-            asyncio.create_task(crypto_rest_fallback([btc, paxg])),
-            asyncio.create_task(gold_worker(gold)),
-            asyncio.create_task(h4_worker(h4)),
-            asyncio.create_task(context_worker(ctx)),
-            asyncio.create_task(alert_loop(stores, proxies, engine)),
-            asyncio.create_task(post_loop(stores, proxies, h4, ctx)),
-            asyncio.create_task(command_worker(stores, proxies, h4, ctx)),
-        ]
-        await asyncio.gather(*tasks)
+async def main_async():
+    global HTTP
+    HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+    btc  = CandleStore("BITCOIN", ws_sym="btcusdt")
+    paxg = CandleStore("PAXG")                      # gold derivatives proxy — live tape
+    gold = CandleStore("GOLD")
+
+    STORES.clear(); STORES.extend([btc, gold])
+    PROXIES["GOLD"] = paxg
+    PROXIES["BITCOIN"] = btc
+
+    log.info(f"{BRAND} starting — assets: BITCOIN, GOLD")
+
+    # bootstraps (sequential — clean logs)
+    await bootstrap_crypto([btc, paxg])
+    await bootstrap_gold(gold)
+
+    tasks = [
+        asyncio.create_task(binance_worker([btc, paxg])),
+        asyncio.create_task(crypto_rest_fallback([btc, paxg])),
+        asyncio.create_task(gold_worker(gold)),
+        asyncio.create_task(h4_worker(H4)),
+        asyncio.create_task(context_worker(CTX)),
+        asyncio.create_task(news_worker()),
+        asyncio.create_task(tick_worker(STORES, PROXIES, H4, CTX)),
+        asyncio.create_task(flow_update_worker(STORES)),
+        asyncio.create_task(daily_outlook_worker(STORES, PROXIES, H4)),
+        asyncio.create_task(session_worker(STORES, PROXIES, H4, CTX)),
+        asyncio.create_task(close_worker(STORES)),
+        asyncio.create_task(weekend_worker(STORES, H4)),
+        asyncio.create_task(command_worker()),
+    ]
+    await asyncio.gather(*tasks)
+
+async def flow_update_worker(stores):
+    while True:
+        await asyncio.sleep(3600)
+        s = session_name()
+        if s and now_eat().hour in FLOW_HOURS:
+            lines = [header(f"FLOW UPDATE — {s}")]
+            for st in stores:
+                fm = flow_metrics(st if st.cvd_ticks else PROXIES.get(st.name, st))
+                if fm:
+                    lines.append(f"{st.name}: {DIR_EMOJI[fm['dir']]} {DIR_WORD[fm['dir']]} "
+                                 f"({fm['conv']}) · {fm['regime']} · CVD 1h {fm['c1h']:+,.0f}")
+                else:
+                    lines.append(f"{st.name}: flow warming up")
+            await tg_send("\n".join(lines) + footer())
+
+async def weekly_review_worker(stores, h4):
+    while True:
+        t = now_eat()
+        if t.weekday() == 5 and t.hour == 10 and t.minute < 2:
+            lines = [header("WEEKEND REVIEW")]
+            for st in stores:
+                df = st.df("1h", 120)
+                if len(df) >= 24 and st.price:
+                    hi = float(df.h.max())
+                    lo = float(df.l.min())
+                    lines.append(f"{st.name} {fp(st.price, st.name)} · 5d range {fp(lo, st.name)}–{fp(hi, st.name)}")
+            lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
+            await tg_send("\n".join(lines) + footer())
+            await asyncio.sleep(86400 // 4)
+        await asyncio.sleep(60)
+
+async def reopen_worker():
+    while True:
+        t = now_eat()
+        if t.weekday() == 6 and t.hour == 21 and 30 <= t.minute < 32:
+            await tg_send(
+                header("REOPEN NOTICE") +
+                f"Gold reopens {gold_next_open_eat().strftime('%H:%M')} EAT.\n"
+                "First 30 min after open is gap noise — desk waits for the tape "
+                "to settle before reading flow.\n\n<i>" + BRAND + "</i>")
+            await asyncio.sleep(300)
+        await asyncio.sleep(60)
+
+def _fix_session_open_texts():
+    pass
+
+# rename guards: session messages use these builders
+def build_session_open_msg(sname: str, stores, h4) -> str:
+    lines = [header(f"{sname} SESSION OPEN — {now_eat().strftime('%H:%M EAT')}")]
+    for st in stores:
+        if st.name == "GOLD" and not gold_market_open():
+            continue
+        intra, wk = structure_read(st, h4)
+        fm = flow_metrics(st if st.cvd_ticks else PROXIES.get(st.name, st))
+        lines.append(f"{st.name} {fp(st.price, st.name) if st.price else '—'} · "
+                     f"{DIR_WORD[intra]} · flow {DIR_WORD[fm['dir']] if fm else 'warming'}")
+    return "\n".join(lines) + footer()
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("BRAX FX shutting down.")
+    asyncio.run(main_async())
