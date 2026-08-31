@@ -52,7 +52,12 @@ BINANCE_REST  = "https://data-api.binance.vision/api/v3"
 BINANCE_FAPI  = "https://fapi.binance.com"
 BINANCE_HOSTS = ["wss://data-stream.binance.vision/stream?streams=",
                  "wss://stream.binance.com:9443/stream?streams="]
+BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/btcusdt@forceOrder"   # forced-liquidation stream
+COINBASE_SPOT  = "https://api.coinbase.com/v2/prices/BTC-USD/spot"    # cross-exchange divergence check
 FF_CAL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+LIQUIDATIONS = deque(maxlen=500)   # (ts, symbol, side, qty, price, notional)
+CROSS_EX = {}                      # name -> {binance, coinbase, divergence_pct, ts}
 
 TICK_INTERVAL      = 10
 GOLD_POLL          = 120
@@ -532,11 +537,11 @@ class ManipulationEngine:
                     f"{note}.\n\n<i>{BRAND}</i>")
 
         # ---- 3. SQUEEZE TRAP
-        recent = [t for t, s, p in st.cvd_ticks if t >= time.time() - 120]
+        recent = [p for t, s, p in st.cvd_ticks if t >= time.time() - 120]
         if len(recent) >= 20 and fm is not None:
             last_p = st.price
-            min_p = min(p for _, _, p in recent)
-            max_p = max(p for _, _, p in recent)
+            min_p = min(recent)
+            max_p = max(recent)
             if abs(min_p - last_p) / max(last_p, 1e-9) < 0.0008 and (max_p - min_p) / min_p > 0.004 \
                     and fm["c1h"] > 0 and self._cool(n, "squeeze_lo", 1800):
                 out.append(
@@ -568,6 +573,19 @@ class ManipulationEngine:
                             f"🛡️ <b>{n} · ABSORPTION AT OFFER</b>\n"
                             f"Price pinned {fp(float(flat.l.min()), n)}–{fp(float(flat.h.max()), n)} "
                             f"while 15m tape is SELLING ({fm['c15']:+,.0f}). Size capping the move.\n\n<i>{BRAND}</i>")
+
+        # ---- 5. LIQUIDATION CASCADE (Binance futures forced-order stream, real-time)
+        recent_liqs = [x for x in LIQUIDATIONS if x[0] >= time.time() - 60 and x[1] == "BTCUSDT"]
+        if len(recent_liqs) >= 5:
+            total_notional = sum(x[5] for x in recent_liqs)
+            if total_notional > 2_000_000 and self._cool(n, "liq_cascade", 900):
+                longs_liq = sum(x[5] for x in recent_liqs if x[2] == "SELL")   # forced sell = long liquidated
+                shorts_liq = sum(x[5] for x in recent_liqs if x[2] == "BUY")   # forced buy = short liquidated
+                skew = "LONGS" if longs_liq > shorts_liq else "SHORTS"
+                out.append(
+                    f"💥 <b>{n} · LIQUIDATION CASCADE</b>\n"
+                    f"${total_notional:,.0f} force-liquidated in the last 60s across {len(recent_liqs)} orders "
+                    f"— {skew} bearing the brunt. Binance futures forced-order stream, live.\n\n<i>{BRAND}</i>")
         return out
 
 # Single instantiation point — everything below can safely reference these.
@@ -799,15 +817,65 @@ async def context_worker(ctx: dict):
                 try:
                     async with HTTP.get(f"{BINANCE_REST}/depth?symbol={fsym}&limit=100") as r:
                         d = await r.json()
-                    bid = sum(float(q) * float(p) for p, q in d.get("bids", []))
-                    ask = sum(float(q) * float(p) for p, q in d.get("asks", []))
+                    bids = [(float(p), float(q)) for p, q in d.get("bids", [])]
+                    asks = [(float(p), float(q)) for p, q in d.get("asks", [])]
+                    bid = sum(q * p for p, q in bids)
+                    ask = sum(q * p for p, q in asks)
                     if bid + ask > 0:
                         c["book"] = (bid - ask) / (bid + ask) * 100
+                    # whale-wall detection — largest single resting order by notional (institutional-desk-style book read)
+                    if bids:
+                        wp, wq = max(bids, key=lambda x: x[0] * x[1])
+                        c["bid_wall"] = {"price": wp, "usd": round(wp * wq)}
+                    if asks:
+                        wp, wq = max(asks, key=lambda x: x[0] * x[1])
+                        c["ask_wall"] = {"price": wp, "usd": round(wp * wq)}
                 except Exception:
                     pass
         except Exception as e:
             log.error(f"context: {e}")
         await asyncio.sleep(CTX_INTERVAL)
+
+async def liquidation_worker():
+    """Real-time forced-liquidation stream (Binance futures) — the same signal institutional
+    desks watch for cascade/squeeze risk. Purely additive: feeds LIQUIDATIONS, used by
+    ManipulationEngine check #5 and exposed on /health. Does not touch existing signal logic."""
+    while True:
+        try:
+            async with HTTP.ws_connect(BINANCE_LIQ_WS, heartbeat=20) as ws:
+                log.info("liquidation stream connected")
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    o = json.loads(msg.data).get("o", {})
+                    if not o:
+                        continue
+                    side = o.get("S")            # SELL = long liquidated, BUY = short liquidated
+                    qty = float(o.get("q", 0) or 0)
+                    price = float(o.get("p", 0) or 0)
+                    LIQUIDATIONS.append((time.time(), "BTCUSDT", side, qty, price, qty * price))
+        except Exception:
+            log.exception("liquidation stream")
+            await asyncio.sleep(5)
+
+async def cross_exchange_worker(stores):
+    """Cross-exchange price check (Binance vs Coinbase spot) — flags venue-specific
+    dislocation, a classic desk red flag for single-exchange spoofing/wash trading.
+    Purely additive: writes CROSS_EX, exposed on /health. Does not touch signal logic."""
+    while True:
+        try:
+            btc = next((s for s in stores if s.name == "BITCOIN"), None)
+            if btc and btc.price:
+                async with HTTP.get(COINBASE_SPOT) as r:
+                    cb = await r.json()
+                cb_price = float(cb["data"]["amount"])
+                if cb_price:
+                    div = (btc.price - cb_price) / cb_price * 100
+                    CROSS_EX["BITCOIN"] = {"binance": btc.price, "coinbase": cb_price,
+                                            "divergence_pct": round(div, 3), "ts": time.time()}
+        except Exception:
+            log.exception("cross_exchange")
+        await asyncio.sleep(30)
 
 # ---------------------------------------------------------------- NEWS
 NEWS = {"events": [], "announced": set()}
@@ -816,11 +884,17 @@ async def news_worker():
     while True:
         try:
             async with HTTP.get(FF_CAL) as r:
-                evs = await r.json()
-            if isinstance(evs, list):
-                NEWS["events"] = [e for e in evs
-                                  if e.get("impact") == "High" and e.get("currency") == "USD"]
-                log.info(f"news: {len(NEWS['events'])} high-impact USD events this week")
+                ctype = r.headers.get("Content-Type", "")
+                if r.status == 429:
+                    log.warning(f"news: rate limited (429) — keeping {len(NEWS['events'])} cached events")
+                elif "json" not in ctype.lower():
+                    log.warning(f"news: non-JSON response (status={r.status}, content-type={ctype}) — keeping cached events")
+                else:
+                    evs = await r.json()
+                    if isinstance(evs, list):
+                        NEWS["events"] = [e for e in evs
+                                          if e.get("impact") == "High" and e.get("currency") == "USD"]
+                        log.info(f"news: {len(NEWS['events'])} high-impact USD events this week")
         except Exception as e:
             log.error(f"news: {e}")
         await asyncio.sleep(1800)
@@ -949,6 +1023,79 @@ def build_daily_outlook(stores, proxies, h4) -> str:
     lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
     return header("DAILY OUTLOOK") + "\n".join(lines) + footer()
 
+def confluence_score(st: CandleStore, proxies: dict, h4: dict) -> dict:
+    """Original confluence scorer for 'Signal of the Day'. Combines structure alignment
+    (1h vs 4h), flow direction/conviction/regime, and a volatility sanity check into a
+    0-10 score with plain-English reasons. This is informational only — it does NOT feed
+    SIGNAL_ENGINE.try_fire and does not change how live entry signals fire."""
+    fs = st if st.cvd_ticks else proxies.get(st.name, st)
+    fm = flow_metrics(fs)
+    if fm is None:
+        return {"score": 0, "dir": "NEUTRAL", "reasons": ["flow still warming up"]}
+    intra, wk = structure_read(st, h4)
+
+    score, reasons = 0, []
+    if intra == wk and intra != "NEUTRAL":
+        score += 3
+        reasons.append(f"1h and 4h structure both {DIR_WORD[intra].lower()}")
+    elif intra != "NEUTRAL":
+        score += 1
+        reasons.append(f"1h structure {DIR_WORD[intra].lower()}, 4h mixed")
+
+    if fm["dir"] == intra and fm["dir"] != "NEUTRAL":
+        score += 3
+        reasons.append(f"tape confirms — {fm['conv'].lower()} conviction {DIR_WORD[fm['dir']].lower()} flow")
+    elif fm["dir"] != "NEUTRAL":
+        score += 1
+        reasons.append(f"flow {DIR_WORD[fm['dir']].lower()} but structure disagrees")
+
+    if fm["conv"] == "High":
+        score += 2
+        reasons.append("strong one-sided conviction")
+    if fm.get("regime") in ("ACCUMULATION", "DISTRIBUTION"):
+        score += 1
+        reasons.append(f"regime: {fm['regime'].lower()} (flow and trend both confirming)")
+
+    d5 = st.df("5min", 30)
+    if len(d5) >= 20:
+        a5 = atr(d5, 14)
+        if a5 and st.price:
+            if a5 / st.price * 100 > 0.05:
+                score += 1
+                reasons.append("volatility supports a move")
+
+    return {"score": min(score, 10), "dir": fm["dir"], "reasons": reasons}
+
+def build_signal_of_the_day(stores, proxies, h4) -> str:
+    """Ranks assets by confluence_score and calls out the single highest-conviction bias —
+    an original scorer built entirely from this desk's own structure+flow engines. This is
+    NOT a reproduction of any third-party product's methodology; nobody outside a vendor's
+    own team can know a proprietary black-box's exact logic, and this makes no such claim."""
+    scored = []
+    for st in stores:
+        if st.name == "GOLD" and not gold_market_open():
+            continue
+        scored.append((st, confluence_score(st, proxies, h4)))
+    if not scored:
+        return ""
+    scored.sort(key=lambda x: x[1]["score"], reverse=True)
+    best_st, best = scored[0]
+
+    lines = []
+    if best["score"] < 5 or best["dir"] == "NEUTRAL":
+        lines.append("No standout setup today — flow and structure aren't aligned enough "
+                      "on either asset for a high-conviction call. Desk stands down.")
+    else:
+        arrow = "▲ LONG BIAS" if best["dir"] == "BULL" else "▼ SHORT BIAS"
+        lines.append(f"🏆 <b>{best_st.name} · {arrow} · Confluence {best['score']}/10</b>\n")
+        lines.append(f"Price: {fp(best_st.price, best_st.name) if best_st.price else '—'}")
+        for r in best["reasons"]:
+            lines.append(f"  • {r}")
+        lines.append("\nThis is a bias call, not an entry trigger — wait for the live "
+                      "/signal alert for exact entry, SL, and TP levels.")
+    lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}")
+    return header("SIGNAL OF THE DAY") + "\n".join(lines) + footer()
+
 def build_now() -> str:
     lines = [header("LIVE DESK — " + now_eat().strftime("%H:%M EAT"))]
     for st in STORES:
@@ -1013,7 +1160,8 @@ HELP_TEXT = (
     "/now — full live desk snapshot\n"
     "/flow — aggressor flow & CVD read\n"
     "/signal — open signals + track record\n"
-    "/health — feed status\n\n"
+    "/health — feed status\n"
+    "/sotd — signal of the day (top confluence bias call)\n\n"
     "Auto: daily outlook 07:00 · session opens · hourly flow updates · "
     "manipulation alerts (stop hunts, fake breaks, squeeze traps) · "
     "A+ signals ≥8/10 confluence with live charts · news warnings 15 min ahead.\n\n"
@@ -1047,8 +1195,8 @@ async def tick_worker(stores, proxies, h4, ctx):
                 await tg_send(m)
             for png, cap in photos:
                 await tg_photo(png, cap)
-        except Exception as e:
-            log.error(f"tick: {e}")
+        except Exception:
+            log.exception("tick")
         await asyncio.sleep(TICK_INTERVAL)
 
 async def flow_update_worker(stores):
@@ -1072,6 +1220,20 @@ async def daily_outlook_worker(stores, proxies, h4):
         t = now_eat()
         if t.hour == 7 and t.minute < 2 and sent_for != t.date():
             await tg_send(build_daily_outlook(stores, proxies, h4))
+            sent_for = t.date()
+        await asyncio.sleep(60)
+
+async def signal_of_day_worker(stores, proxies, h4):
+    """Auto-sends the confluence-based Signal of the Day at 07:05 EAT — 5 min after the
+    existing daily outlook so the two messages don't collide. Also available on-demand
+    via /sotd. Purely additive; does not alter daily_outlook_worker or SIGNAL_ENGINE."""
+    sent_for = None
+    while True:
+        t = now_eat()
+        if t.hour == 7 and 5 <= t.minute < 7 and sent_for != t.date():
+            msg = build_signal_of_the_day(stores, proxies, h4)
+            if msg:
+                await tg_send(msg)
             sent_for = t.date()
         await asyncio.sleep(60)
 
@@ -1166,6 +1328,8 @@ async def command_worker():
                         await tg_send(card)
                 elif cmd == "/health":
                     await tg_send(build_health())
+                elif cmd == "/sotd":
+                    await tg_send(build_signal_of_the_day(STORES, PROXIES, H4))
                 elif cmd in ("/help", "/start"):
                     await tg_send(HELP_TEXT)
         except Exception as e:
@@ -1174,6 +1338,14 @@ async def command_worker():
 
 # ---------------------------------------------------------------- FLASK HEALTH SERVER
 app = Flask(__name__)
+
+@app.route("/")
+def root():
+    return jsonify({
+        "status": "ok",
+        "service": BRAND,
+        "health": "/health",
+    })
 
 @app.route("/health")
 def health():
@@ -1185,6 +1357,10 @@ def health():
                             "age_s": round(s.data_age())} for s in STORES},
         "signals_open": list(SIGNAL_ENGINE.active.keys()),
         "record": SIGNAL_ENGINE.record,
+        "context": {name: {k: v for k, v in c.items()} for name, c in CTX.items()},
+        "cross_exchange": CROSS_EX,
+        "liquidations_5m_usd": round(sum(
+            x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 300)),
     })
 
 def run_flask():
@@ -1217,10 +1393,13 @@ async def main_async():
         asyncio.create_task(gold_worker(gold)),
         asyncio.create_task(h4_worker(H4)),
         asyncio.create_task(context_worker(CTX)),
+        asyncio.create_task(liquidation_worker()),
+        asyncio.create_task(cross_exchange_worker(STORES)),
         asyncio.create_task(news_worker()),
         asyncio.create_task(tick_worker(STORES, PROXIES, H4, CTX)),
         asyncio.create_task(flow_update_worker(STORES)),
         asyncio.create_task(daily_outlook_worker(STORES, PROXIES, H4)),
+        asyncio.create_task(signal_of_day_worker(STORES, PROXIES, H4)),
         asyncio.create_task(session_worker(STORES, PROXIES, H4, CTX)),
         asyncio.create_task(close_worker(STORES)),
         asyncio.create_task(weekend_worker(STORES, H4)),
