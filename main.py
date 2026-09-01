@@ -410,8 +410,17 @@ class SignalEngine:
         self.last_fire[n] = time.time()
         why = " · ".join(parts.keys())
         arrow = "▲ LONG" if d == "BULL" else "▼ SHORT"
+        side = "long" if d == "BULL" else "short"
+        lean = "bullish" if d == "BULL" else "bearish"
+        opener = random.choice([
+            f"Tape's leaning hard {lean} and structure's backing it up.",
+            f"Flow, structure, and positioning are all lined up on the {side} side here.",
+            f"This one's been building for a while — taking it {side}.",
+            f"Clean read. Book, flow, and structure all agree — going {side}.",
+        ])
         return (f"🎯 <b>{n} · A+ SETUP · {arrow}</b>\n"
-                f"Confluence <b>{score}/{SIGNAL_MAX_SCORE}</b> — structure, flow, regime, positioning aligned.\n"
+                f"{opener}\n"
+                f"Confluence <b>{score}/{SIGNAL_MAX_SCORE}</b>\n"
                 f"Entry {fp(entry, n)} · SL {fp(sl, n)} · TP1 {fp(tp1, n)} · TP2 {fp(tp2, n)}\n"
                 f"<i>{why}</i>\n\n"
                 f"Educational — not financial advice. Risk only what you can lose.")
@@ -431,18 +440,33 @@ class SignalEngine:
         if hit_sl:
             del self.active[n]
             self.record["sl"] += 1
+            line = random.choice([
+                "Structure invalidated — stopped out clean.",
+                "Didn't work out. Stopped, no argument.",
+                "Invalidated. Taking the loss and standing down.",
+            ])
             return [f"❌ <b>{n} · SIGNAL CLOSED — SL HIT</b>\n"
-                    f"Structure invalidated. Desk stands down for {SIGNAL_COOLDOWN//3600}h.\n\n<i>{BRAND}</i>"]
+                    f"{line} Desk stands down for {SIGNAL_COOLDOWN//3600}h.\n\n<i>{BRAND}</i>"]
         if hit_tp1 and not sig["tp1_hit"]:
             sig["tp1_hit"] = True
             self.record["tp1"] += 1
+            line = random.choice([
+                "First target down.",
+                "TP1 in the bag.",
+                "Booked the first target.",
+            ])
             return [f"✅ <b>{n} · TP1 HIT</b> — {fp(sig['tp1'], n)}\n"
-                    f"TP2 {fp(sig['tp2'], n)} remains. Trail risk.\n\n<i>{BRAND}</i>"]
+                    f"{line} TP2 {fp(sig['tp2'], n)} still open — trail your stop.\n\n<i>{BRAND}</i>"]
         if sig["tp1_hit"] and hit_tp2:
             del self.active[n]
             self.record["tp2"] += 1
+            line = random.choice([
+                "Full target complete. Clean trade.",
+                "Both targets hit — that's the whole move.",
+                "Ran it all the way to TP2.",
+            ])
             return [f"🏆 <b>{n} · TP2 HIT — FULL TARGET COMPLETE</b> · {fp(sig['tp2'], n)}\n"
-                    f"Cycle closed.\n\n<i>{BRAND}</i>"]
+                    f"{line}\n\n<i>{BRAND}</i>"]
         return []
 
     def record_line(self) -> str:
@@ -1427,7 +1451,7 @@ async def main_async():
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
     btc  = CandleStore("BITCOIN", ws_sym="btcusdt")
-    paxg = CandleStore("PAXG")                      # gold derivatives proxy — live tape
+    paxg = CandleStore("PAXG", ws_sym="paxgusdt")    # gold derivatives proxy — live tape
     gold = CandleStore("GOLD")
 
     STORES.clear(); STORES.extend([btc, gold])
