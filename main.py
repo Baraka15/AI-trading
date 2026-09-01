@@ -9,16 +9,17 @@ AUTO POSTS (fully autonomous)
   • FLOW UPDATE       — hourly in-session
   • REAL-TIME ALERTS  — flow flip · absorption · liquidity sweep · VWAP cross
   • MANIPULATION      — stop hunts · fake breakouts · squeeze traps · absorption
-  • A+ SIGNALS        — >=8/10 confluence, ATR SL/TP, chart attached, tracked to outcome
+  • A+ SIGNALS        — >=10/12 confluence, ATR SL/TP, chart attached, tracked to outcome
   • NEWS ALERTS       — 15 min before high-impact USD events
   • NY Close 21:00 · Weekend Review Sat 10:00 · Reopen notice Sun 21:30 EAT
 
-COMMANDS  /now /flow /signal /health /help
+COMMANDS  /now /flow /signal /health /help /sotd
 
 SIGNAL RULES
   • BTC only (gold has no live aggressor tape — no honest gold signals)
-  • Score >= 8/10 confluence · max 2/day · 4h cooldown
+  • Score >= 10/12 confluence · max 2/day · 4h cooldown
   • Skipped 15 min around high-impact USD news
+  • Skipped for 60s after a $2M+ liquidation flush (active-cascade risk)
   • Every signal tracked: TP1 -> TP2 or SL, reported publicly
 
 DEPLOY   Render · Start: python main.py · Build: pip install -r requirements.txt
@@ -54,6 +55,12 @@ BINANCE_HOSTS = ["wss://data-stream.binance.vision/stream?streams=",
                  "wss://stream.binance.com:9443/stream?streams="]
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/btcusdt@forceOrder"   # forced-liquidation stream
 COINBASE_SPOT  = "https://api.coinbase.com/v2/prices/BTC-USD/spot"    # cross-exchange divergence check
+BYBIT_TICKERS  = "https://api.bybit.com/v5/market/tickers"            # public fallback for funding/OI
+                                                                        # (Binance fapi.binance.com returns
+                                                                        # HTTP 451 from US-region cloud hosts
+                                                                        # per Binance's own ToS geo-enforcement —
+                                                                        # this is a documented, legal public
+                                                                        # market-data endpoint, no auth needed)
 FF_CAL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 LIQUIDATIONS = deque(maxlen=500)   # (ts, symbol, side, qty, price, notional)
@@ -68,7 +75,8 @@ STALE_FEED_SEC     = 300
 ALERT_COOLDOWN     = 300
 MIN_ONESIDED_ALERT = 0.30
 VWAP_DEV_MIN       = 0.05
-SIGNAL_MIN_SCORE   = 8
+SIGNAL_MAX_SCORE   = 12   # was 10; raised when cross-exchange + clear-path factors were added
+SIGNAL_MIN_SCORE   = 10   # was 8/10 (80%); kept at ~83% of new max so more data != looser bar
 SIGNAL_COOLDOWN    = 4 * 3600
 MAX_SIGNALS_DAY    = 2
 ATR_SL_MULT        = 1.5
@@ -309,8 +317,11 @@ def agreement(intra: str, flow: str):
 SIGNAL_ENGINE = SignalEngine() if False else None   # placeholder removed below
 
 class SignalEngine:
-    """Maximum-confluence signals only (BTC). Score /10, fire at >= 8.
-    Tracked to outcome publicly. No gold signals (no live gold tape)."""
+    """Maximum-confluence signals only (BTC). Score /12, fire at >= 10.
+    Tracked to outcome publicly. No gold signals (no live gold tape).
+    v2: added cross-exchange confirmation + clear-path (whale-wall) factors,
+    and a liquidation-cascade pause gate in try_fire (risk-timing, not a
+    confluence opinion — avoids entering fresh into an active flush)."""
 
     def __init__(self):
         self.active = {}
@@ -353,6 +364,17 @@ class SignalEngine:
         if bk is not None:
             if (fm["dir"] == "BULL" and bk > 0) or (fm["dir"] == "BEAR" and bk < 0):
                 parts["book supports"] = 1
+        # --- new factors (added with explicit owner permission on top of the original /10 rubric) ---
+        xex = CROSS_EX.get("BITCOIN")
+        if xex is not None and abs(xex.get("divergence_pct", 99)) < 0.15:
+            parts["cross-exchange confirms"] = 1
+        wall_key = "ask_wall" if fm["dir"] == "BULL" else "bid_wall"
+        wall = c.get(wall_key)
+        if st.price and c.get("book") is not None:   # only score this if depth data actually loaded this cycle
+            blocked = (wall is not None and wall.get("usd", 0) >= 100_000
+                       and abs(wall["price"] - st.price) / st.price < 0.003)
+            if not blocked:
+                parts["clear path"] = 1
         return fm["dir"], sum(parts.values()), parts
 
     def try_fire(self, st: CandleStore, h4: dict, ctx: dict):
@@ -360,6 +382,13 @@ class SignalEngine:
         if n != "BITCOIN" or n in self.active or not self._allowed(n):
             return None
         if news_blackout():
+            return None
+        # liquidation-cascade pause: don't open a fresh position while $2M+ has just
+        # been force-liquidated in the last 60s (same threshold as the cascade alert) --
+        # active flushes mean abnormal volatility/slippage risk regardless of direction.
+        recent_liq_notional = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 60)
+        if recent_liq_notional > 2_000_000:
+            log.info(f"try_fire: skipped, ${recent_liq_notional:,.0f} liquidated in last 60s")
             return None
         d, score, parts = self.score(st, h4, ctx)
         if d is None or score < SIGNAL_MIN_SCORE:
@@ -382,7 +411,7 @@ class SignalEngine:
         why = " · ".join(parts.keys())
         arrow = "▲ LONG" if d == "BULL" else "▼ SHORT"
         return (f"🎯 <b>{n} · A+ SETUP · {arrow}</b>\n"
-                f"Confluence <b>{score}/10</b> — structure, flow, regime, positioning aligned.\n"
+                f"Confluence <b>{score}/{SIGNAL_MAX_SCORE}</b> — structure, flow, regime, positioning aligned.\n"
                 f"Entry {fp(entry, n)} · SL {fp(sl, n)} · TP1 {fp(tp1, n)} · TP2 {fp(tp2, n)}\n"
                 f"<i>{why}</i>\n\n"
                 f"Educational — not financial advice. Risk only what you can lose.")
@@ -806,14 +835,38 @@ async def context_worker(ctx: dict):
                 c = ctx.setdefault(name, {})
                 try:
                     async with HTTP.get(f"{BINANCE_FAPI}/fapi/v1/premiumIndex?symbol={fsym}") as r:
+                        if r.status != 200:
+                            raise RuntimeError(f"binance fapi funding status={r.status}")
                         c["funding"] = float((await r.json()).get("lastFundingRate", 0)) * 100
-                except Exception:
-                    pass
+                except Exception as e:
+                    if fsym == "BTCUSDT":
+                        log.warning(f"context: binance funding fetch failed for {fsym} ({e}); trying bybit fallback")
+                    else:
+                        log.warning(f"context: binance funding fetch failed for {fsym} ({e}); no fallback for this symbol")
+                    if fsym == "BTCUSDT":
+                        try:
+                            async with HTTP.get(f"{BYBIT_TICKERS}?category=linear&symbol=BTCUSDT") as r2:
+                                j = await r2.json()
+                            row = (j.get("result", {}).get("list") or [{}])[0]
+                            c["funding"] = float(row.get("fundingRate", 0)) * 100
+                            c["funding_source"] = "bybit"
+                        except Exception as e2:
+                            log.warning(f"context: bybit funding fallback also failed ({e2})")
                 try:
                     async with HTTP.get(f"{BINANCE_FAPI}/fapi/v1/openInterest?symbol={fsym}") as r:
+                        if r.status != 200:
+                            raise RuntimeError(f"binance fapi OI status={r.status}")
                         c["oi"] = float((await r.json()).get("openInterest", 0))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"context: binance OI fetch failed for {fsym} ({e})")
+                    if fsym == "BTCUSDT":
+                        try:
+                            async with HTTP.get(f"{BYBIT_TICKERS}?category=linear&symbol=BTCUSDT") as r2:
+                                j = await r2.json()
+                            row = (j.get("result", {}).get("list") or [{}])[0]
+                            c["oi"] = float(row.get("openInterest", 0))
+                        except Exception as e2:
+                            log.warning(f"context: bybit OI fallback also failed ({e2})")
                 try:
                     async with HTTP.get(f"{BINANCE_REST}/depth?symbol={fsym}&limit=100") as r:
                         d = await r.json()
@@ -830,8 +883,8 @@ async def context_worker(ctx: dict):
                     if asks:
                         wp, wq = max(asks, key=lambda x: x[0] * x[1])
                         c["ask_wall"] = {"price": wp, "usd": round(wp * wq)}
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"context: depth/whale-wall fetch failed for {fsym} ({e})")
         except Exception as e:
             log.error(f"context: {e}")
         await asyncio.sleep(CTX_INTERVAL)
@@ -1105,7 +1158,7 @@ def build_now() -> str:
     if SIGNAL_ENGINE.active:
         for n, s in SIGNAL_ENGINE.active.items():
             arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
-            lines.append(f"🎯 Open signal: {n} {arrow} · {s['score']}/10 · "
+            lines.append(f"🎯 Open signal: {n} {arrow} · {s['score']}/{SIGNAL_MAX_SCORE} · "
                          f"entry {fp(s['entry'], n)} · SL {fp(s['sl'], n)} · "
                          f"TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
     lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
@@ -1130,15 +1183,15 @@ def build_signal_card() -> str:
     lines = [header("SIGNAL DESK")]
     lines.append(SIGNAL_ENGINE.record_line())
     lines.append(f"Today: {SIGNAL_ENGINE.counts.get(now_eat().strftime('%Y-%m-%d'), 0)}/{MAX_SIGNALS_DAY} · "
-                 f"min confluence {SIGNAL_MIN_SCORE}/10")
+                 f"min confluence {SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE}")
     if SIGNAL_ENGINE.active:
         for n, s in SIGNAL_ENGINE.active.items():
             arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
-            lines.append(f"\n🎯 {n} {arrow} · {s['score']}/10")
+            lines.append(f"\n🎯 {n} {arrow} · {s['score']}/{SIGNAL_MAX_SCORE}")
             lines.append(f"Entry {fp(s['entry'], n)} · SL {fp(s['sl'], n)}")
             lines.append(f"TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
     else:
-        lines.append("\nNo open signal — desk fires only at ≥8/10 confluence.")
+        lines.append(f"\nNo open signal — desk fires only at ≥{SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE} confluence.")
     return "\n".join(lines) + footer()
 
 def build_health() -> str:
@@ -1164,7 +1217,7 @@ HELP_TEXT = (
     "/sotd — signal of the day (top confluence bias call)\n\n"
     "Auto: daily outlook 07:00 · session opens · hourly flow updates · "
     "manipulation alerts (stop hunts, fake breaks, squeeze traps) · "
-    "A+ signals ≥8/10 confluence with live charts · news warnings 15 min ahead.\n\n"
+    f"A+ signals ≥{SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE} confluence with live charts · news warnings 15 min ahead.\n\n"
     f"🎯 {SIGNAL_ENGINE.record_line()}\n\n<i>{FOOT}</i>"
 )
 
