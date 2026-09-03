@@ -1153,100 +1153,158 @@ def footer() -> str:
 
 def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
                 feed_note: str = "") -> str:
-    n = st.name
-    p = st.price
+    n  = st.name
+    p  = st.price
+    c  = ctx.get(n, {})
     intra, wk = structure_read(st, h4)
     fs = st if st.cvd_ticks else proxy
     fm = flow_metrics(fs)
     fl = fm["dir"] if fm else "NEUTRAL"
-    conv = fm["conv"] if fm else "—"
-    pct, grade = agreement_full(intra, wk, fl)
-    fs_label = "live tape" if fs is st else "PAXG proxy tape"
-    lines = [f"<b>{n}</b> — {fp(p, n)}" if p else f"<b>{n}</b> — awaiting data"]
+    _, grade = agreement_full(intra, wk, fl)
 
-    # 24h range + position
+    # ── header line: asset + price + range context ─────────────────────
     df24 = st.df("1h", 24)
+    range_ctx = ""
     if not df24.empty and p:
         hi, lo = float(df24.h.max()), float(df24.l.min())
         if hi > lo:
             pos = (p - lo) / (hi - lo) * 100
-            pos_word = "near highs" if pos > 70 else ("near lows" if pos < 30 else "mid-range")
-            lines.append(f"24h {fp(lo, n)} – {fp(hi, n)} · {pos:.0f}% of range ({pos_word})")
+            range_ctx = (
+                "pushing near the top of its range" if pos > 80 else
+                "upper half of its range"            if pos > 60 else
+                "mid-range, no clean edge from price alone" if pos > 40 else
+                "lower half of its range"            if pos > 20 else
+                "pressing near the lows"
+            )
+    status = DIR_EMOJI[fl] if fl != "NEUTRAL" else "⚪"
+    head = f"{status} <b>{n}</b>  {fp(p, n) if p else '—'}"
+    if range_ctx:
+        head += f"  —  {range_ctx}"
 
-    # VWAP + bands
-    vw = st.vwap()
-    if vw:
-        dev = st.vwap_dev_pct()
-        side = "above" if dev > 0 else "below"
-        _, vw_up, vw_dn = vwap_bands(st)
-        if vw_up and p:
-            stretched = p >= vw_up or p <= vw_dn
-            band_note = " · ⚠️ stretched — mean-reversion risk" if stretched else " · within bands"
-            lines.append(f"VWAP {fp(vw, n)} · {abs(dev):.2f}% {side}{band_note}")
+    # ── paragraph 1: tape + structure, plain English ────────────────────
+    if fm and fl != "NEUTRAL":
+        regime_read = {
+            "ACCUMULATION":   "tape's been buying consistently all session",
+            "DISTRIBUTION":   "tape's been selling into every bid",
+            "PULLBACK-BUYING":"buyers stepping in on every dip",
+            "RALLY-SELLING":  "sellers pressing into every rally",
+            "CHOP":           "both sides active — no clear conviction",
+        }.get(fm.get("regime", ""), fm.get("regime","").replace("-"," ").lower())
+
+        conv_read = {
+            "High":   "strong one-sided conviction",
+            "Medium": "moderate conviction",
+            "Low":    "low conviction — respect the risk",
+        }.get(fm["conv"], fm["conv"])
+
+        if intra == fl and wk == fl:
+            struct = f"All three timeframes aligned {DIR_WORD[fl].lower()}. Clean read."
+        elif intra == fl:
+            struct = f"1h structure and flow both {DIR_WORD[fl].lower()}. 4h is mixed — watch for follow-through."
+        elif wk == fl:
+            struct = f"Weekly and flow lean {DIR_WORD[fl].lower()} but intraday structure hasn't confirmed yet."
         else:
-            lines.append(f"VWAP {fp(vw, n)} · price {abs(dev):.2f}% {side} session avg")
+            struct = f"Flow reads {DIR_WORD[fl].lower()} but structure disagrees. No clean edge — don't force it."
 
-    # Flow + CVD acceleration
-    if fm:
-        regime_clean = fm["regime"].replace("-", " ").lower()
-        acc_ratio, acc_label = cvd_acceleration(fs)
-        lines.append(f"Flow {DIR_EMOJI[fl]} {DIR_WORD[fl]} ({conv} conviction) · {regime_clean} · {fs_label}")
-        lines.append(f"CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f} · tape {acc_label}")
+        _, acc_label = cvd_acceleration(fs)
+        acc_note = (
+            " Tape accelerating — pressure is building."  if "accelerating" in acc_label else
+            " Flow starting to fade — watch for a stall." if "fading"       in acc_label else
+            " Tape reversing direction."                  if "reversing"    in acc_label else ""
+        )
+
+        vwap_note = ""
+        vw = st.vwap()
+        if vw and p:
+            dev = st.vwap_dev_pct()
+            _, vwup, vwdn = vwap_bands(st)
+            if vwup and (p >= vwup or p <= vwdn):
+                vwap_note = (f" Price is {abs(dev):.1f}% {'above' if dev > 0 else 'below'} session VWAP"
+                             f" — stretched, mean-reversion risk if momentum stalls.")
+            elif abs(dev) > 0.1:
+                vwap_note = f" {abs(dev):.1f}% {'above' if dev > 0 else 'below'} session VWAP."
+
+        tape_para = f"{DIR_WORD[fl]}. {struct} {conv_read.capitalize()}, {regime_read}.{acc_note}{vwap_note}"
     else:
-        lines.append(f"Flow ⚪ Warming up · {fs_label}")
+        vw = st.vwap()
+        if fm and fl == "NEUTRAL":
+            tape_para = "Tape is balanced — neither side has conviction. Desk waits."
+        elif vw and p:
+            tape_para = (f"Flow warming up. Price {'above' if p > vw else 'below'} "
+                         f"session VWAP {fp(vw, n)} — no tape read yet.")
+        else:
+            tape_para = "Flow warming up — no read yet."
 
-    # Structure + 4-tier agreement
-    lines.append(f"Structure {DIR_EMOJI[intra]} {DIR_WORD[intra]} intraday · Weekly {DIR_EMOJI[wk]} {DIR_WORD[wk]}")
-    lines.append(f"Agreement {pct}% {bar(pct)} · Grade {grade}")
-
-    # Derivatives context
-    c = ctx.get(n, {})
-    der = []
+    # ── paragraph 2: positioning ─────────────────────────────────────────
+    pos_parts = []
     if "funding" in c:
         fr = c["funding"]
-        fr_note = "longs paying" if fr > 0 else ("shorts paying" if fr < 0 else "flat")
-        source = c.get("funding_source", "binance")
-        # funding trend from FUNDING_HIST
         recent_f = [f for t, f in FUNDING_HIST if t >= time.time() - 7200]
+        f_trend = ""
         if len(recent_f) >= 3:
-            trend = recent_f[-1] - recent_f[0]
-            f_trend = "↑ rising" if trend > 0.001 else ("↓ falling" if trend < -0.001 else "stable")
-        else:
-            f_trend = ""
-        der.append(f"Funding {fr:+.4f}% ({fr_note}) {f_trend} [{source}]")
+            delta = recent_f[-1] - recent_f[0]
+            f_trend = (", rising" if delta > 0.001 else
+                       ", falling" if delta < -0.001 else "")
+        pos_parts.append(
+            f"Funding leans long (longs paying{f_trend})" if fr > 0.01 else
+            f"Funding leans short (shorts paying{f_trend})" if fr < -0.01 else
+            f"Funding flat{f_trend} — market not crowded either way"
+        )
     if c.get("oi"):
-        oi_str = fmt_vol(c["oi"]) + " BTC"
         oi_chg = c.get("oi_chg_pct")
         if oi_chg is not None:
-            oi_note = "↑ growing" if oi_chg > 0.05 else ("↓ shrinking" if oi_chg < -0.05 else "flat")
-            oi_str += f" ({oi_note})"
-        der.append(f"OI {oi_str}")
+            pos_parts.append(
+                "OI growing — new money entering the market" if oi_chg > 0.05 else
+                "OI shrinking — positions being closed, deleveraging" if oi_chg < -0.05 else
+                "OI flat"
+            )
     if "book" in c:
         bk = c["book"]
-        der.append(f"Book {'bid' if bk > 0 else 'ask'}-heavy {abs(bk):.1f}%")
-    if der:
-        lines.append(" · ".join(der))
+        if abs(bk) > 8:
+            pos_parts.append(f"Order book {'bid' if bk > 0 else 'ask'}-heavy ({abs(bk):.0f}%)")
+    pos_para = ". ".join(p[0].upper() + p[1:] for p in pos_parts) + "." if pos_parts else ""
 
-    # Whale walls
+    # ── key resting orders ────────────────────────────────────────────────
     bid_w = c.get("bid_wall")
     ask_w = c.get("ask_wall")
-    if bid_w and ask_w:
-        lines.append(f"Walls: bid ${bid_w['usd']:,} @ {fp(bid_w['price'], n)} · "
-                     f"ask ${ask_w['usd']:,} @ {fp(ask_w['price'], n)}")
+    wall_para = ""
+    if bid_w and ask_w and p:
+        ask_close = ask_w["usd"] >= 80_000 and abs(ask_w["price"] - p) / p < 0.005
+        ask_note  = " ← wall directly in the way" if ask_close else ""
+        wall_para = (f"Resting orders: ${bid_w['usd']:,} bid at {fp(bid_w['price'], n)}, "
+                     f"${ask_w['usd']:,} ask at {fp(ask_w['price'], n)}{ask_note}.")
 
-    # Cross-exchange divergence (BTC only)
+    # ── cross-exchange (BTC only) ─────────────────────────────────────────
+    xex_para = ""
     if n == "BITCOIN":
         xex = CROSS_EX.get("BITCOIN")
         if xex and time.time() - xex.get("ts", 0) < 120:
             div = xex["divergence_pct"]
-            div_note = "in line ✓" if abs(div) < 0.1 else f"⚠️ {abs(div):.3f}% dislocation"
-            lines.append(f"Cross-ex: Binance {fp(xex['binance'], n)} · Coinbase {fp(xex['coinbase'], n)} · {div_note}")
+            xex_para = (
+                f"⚠️ Venue gap: Binance {fp(xex['binance'], n)} vs Coinbase {fp(xex['coinbase'], n)} "
+                f"({abs(div):.3f}% apart) — check for single-exchange artifact."
+                if abs(div) >= 0.15 else "Coinbase in line ✓"
+            )
 
-    if feed_note:
-        lines.append(feed_note)
-    age = st.data_age()
-    lines.append(f"Feed: {st.source} · {'live' if age < STALE_FEED_SEC else f'⚠️ stale {int(age/60)}m'}")
-    return "\n".join(lines)
+    # ── grade + feed ──────────────────────────────────────────────────────
+    grade_desc = {
+        "A+":   "all three timeframes aligned — highest quality read on the board",
+        "A":    "1h and flow agree — strong setup",
+        "B":    "partial alignment — trade with a tighter leash",
+        "C":    "structure and flow disagree — no edge here",
+        "MIXED":"no directional edge — desk stands down",
+    }
+    grade_line = f"Grade <b>{grade}</b> — {grade_desc.get(grade, '')}"
+    age     = st.data_age()
+    feed_ok = age < STALE_FEED_SEC
+    feed_line = f"{'🟢' if feed_ok else '🔴'} {st.source}{'' if feed_ok else f' — ⚠️ {int(age/60)}m stale'}"
+
+    parts = [head, "", tape_para]
+    if pos_para:   parts.append(pos_para)
+    if wall_para:  parts.append(wall_para)
+    if xex_para:   parts.append(xex_para)
+    parts += [grade_line, feed_line]
+    return "\n".join(parts)
 
 def build_daily_outlook(stores, proxies, h4) -> str:
     t = now_eat()
@@ -1343,10 +1401,6 @@ def confluence_score(st: CandleStore, proxies: dict, h4: dict) -> dict:
     return {"score": min(score, 10), "dir": fm["dir"], "reasons": reasons}
 
 def build_signal_of_the_day(stores, proxies, h4) -> str:
-    """Ranks assets by confluence_score and calls out the single highest-conviction bias —
-    an original scorer built entirely from this desk's own structure+flow engines. This is
-    NOT a reproduction of any third-party product's methodology; nobody outside a vendor's
-    own team can know a proprietary black-box's exact logic, and this makes no such claim."""
     scored = []
     for st in stores:
         if st.name == "GOLD" and not gold_market_open():
@@ -1355,28 +1409,49 @@ def build_signal_of_the_day(stores, proxies, h4) -> str:
     if not scored:
         return ""
     scored.sort(key=lambda x: x[1]["score"], reverse=True)
-    best_st, best = scored[0]
 
-    lines = []
-    if best["score"] < 5 or best["dir"] == "NEUTRAL":
+    t_str = now_eat().strftime("%H:%M EAT")
+    lines = [f"📡 <b>SIGNAL OF THE DAY — {t_str}</b>\n{BRAND}\n"]
+
+    any_clean = any(d["score"] >= 5 and d["dir"] != "NEUTRAL" for _, d in scored)
+
+    for i, (st, d) in enumerate(scored):
+        n = st.name
+        price_str = fp(st.price, n) if st.price else "—"
+
+        if d["score"] < 5 or d["dir"] == "NEUTRAL":
+            lines.append(
+                f"<b>{n}</b>  {price_str}\n" +
+                random.choice([
+                    "No clean bias. Flow and structure not aligned enough to call a direction.",
+                    "Mixed read — neither side has enough conviction. Desk won't force it.",
+                    "Too much disagreement between timeframes. Standing aside on this one.",
+                ])
+            )
+        else:
+            arrow  = "▲ LONG" if d["dir"] == "BULL" else "▼ SHORT"
+            medal  = "🥇 TOP PICK" if i == 0 else "🥈"
+            reasons_prose = ", ".join(d["reasons"]).capitalize()
+            lines.append(
+                f"<b>{n}</b>  {price_str}  ·  {medal}  ·  <b>{arrow} · {d['score']}/10</b>\n"
+                f"{reasons_prose}."
+            )
+
+    if any_clean:
         lines.append(random.choice([
-            "No standout setup today — flow and structure aren't lined up enough on either asset. Desk stands down.",
-            "Not seeing a clean setup right now. Neither asset has the alignment needed for a high-conviction call.",
-            "Markets are mixed. Waiting for something cleaner before calling a direction.",
+            "Bias only — not a trade entry. Wait for /signal for the exact entry, SL, and TP.",
+            "This is the directional lean for today. /signal fires with full levels when the setup confirms.",
+            "Direction is set. Sit on your hands until /signal fires — that's where execution happens.",
         ]))
     else:
-        arrow = "▲ LONG BIAS" if best["dir"] == "BULL" else "▼ SHORT BIAS"
-        price_str = fp(best_st.price, best_st.name) if best_st.price else "—"
-        reasons_prose = ", ".join(best["reasons"])
-        lines.append(f"🏆 <b>{best_st.name} · {arrow} · Confluence {best['score']}/10</b>\n")
-        lines.append(f"Currently at {price_str}. {reasons_prose.capitalize()}.")
         lines.append(random.choice([
-            "\nBias only — not a trade signal. The /signal alert gives you the exact entry, SL, and TP when the setup fires.",
-            "\nThis is the directional lean for today. Actual entry, SL, and targets come through /signal when the setup confirms.",
-            "\nWait for the live signal before entering — this is the desk's bias, not a trigger.",
+            "No standout setup on either asset today. Desk stands down.",
+            "Both assets are mixed. No call worth making — patience is a position.",
+            "Not seeing anything clean on BTC or Gold. Waiting for the market to show its hand.",
         ]))
+
     lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}")
-    return header("SIGNAL OF THE DAY") + "\n".join(lines) + footer()
+    return "\n\n".join(lines) + footer()
 
 def build_now() -> str:
     lines = [header("LIVE DESK — " + now_eat().strftime("%H:%M EAT"))]
