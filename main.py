@@ -61,7 +61,8 @@ BYBIT_TICKERS  = "https://api.bybit.com/v5/market/tickers"            # public f
                                                                         # per Binance's own ToS geo-enforcement —
                                                                         # this is a documented, legal public
                                                                         # market-data endpoint, no auth needed)
-FF_CAL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+FF_CAL     = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+FF_CAL_CDN = "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json"  # CDN fallback
 
 LIQUIDATIONS   = deque(maxlen=500)   # (ts, symbol, side, qty, price, notional)
 CROSS_EX       = {}                   # name -> {binance, coinbase, divergence_pct, ts}
@@ -993,21 +994,37 @@ NEWS = {"events": [], "announced": set()}
 
 async def news_worker():
     while True:
-        try:
-            async with HTTP.get(FF_CAL) as r:
-                ctype = r.headers.get("Content-Type", "")
-                if r.status == 429:
-                    log.warning(f"news: rate limited (429) — keeping {len(NEWS['events'])} cached events")
-                elif "json" not in ctype.lower():
-                    log.warning(f"news: non-JSON response (status={r.status}, content-type={ctype}) — keeping cached events")
-                else:
+        evs = None
+        for url in (FF_CAL, FF_CAL_CDN):
+            try:
+                async with HTTP.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    ctype = r.headers.get("Content-Type", "")
+                    if r.status == 429:
+                        log.warning(f"news: 429 from {url} — keeping {len(NEWS['events'])} cached")
+                        break
+                    if r.status != 200:
+                        log.warning(f"news: status {r.status} from {url}")
+                        continue
+                    if "json" not in ctype.lower():
+                        log.warning(f"news: non-JSON ({ctype}) from {url}")
+                        continue
                     evs = await r.json()
-                    if isinstance(evs, list):
-                        NEWS["events"] = [e for e in evs
-                                          if e.get("impact") == "High" and e.get("currency") == "USD"]
-                        log.info(f"news: {len(NEWS['events'])} high-impact USD events this week")
-        except Exception as e:
-            log.error(f"news: {e}")
+                    log.info(f"news: fetched {len(evs)} raw events from {url}")
+                    break
+            except Exception as e:
+                log.warning(f"news: fetch error from {url}: {e}")
+        if evs is not None and isinstance(evs, list):
+            # FF JSON uses 'country' (not 'currency') and 'impact' == 'High'
+            filtered = [e for e in evs
+                        if e.get("impact") == "High"
+                        and e.get("country") == "USD"]
+            NEWS["events"] = filtered
+            log.info(f"news: {len(filtered)} high-impact USD events this week "
+                     f"(from {len(evs)} total — filter: impact=High, country=USD)")
+            if not filtered:
+                # log a sample so we can debug field names if they change again
+                sample = evs[:3] if evs else []
+                log.warning(f"news: zero events passed filter — sample raw: {sample}")
         await asyncio.sleep(1800)
 
 def _event_dt(e):
