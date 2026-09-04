@@ -16,7 +16,7 @@ AUTO POSTS (fully autonomous)
 COMMANDS  /now /flow /dayoutlook /signal /health /help /sotd
 
 SIGNAL RULES
-  • BTC only (gold has no live aggressor tape — no honest gold signals)
+  • BTC + Gold signals · ≥10/12 confluence · max 2/day · 4h cooldown
   • Score >= 10/12 confluence · max 2/day · 4h cooldown
   • Skipped 15 min around high-impact USD news
   • Skipped for 60s after a $2M+ liquidation flush (active-cascade risk)
@@ -371,11 +371,9 @@ def agreement_full(intra: str, wk: str, flow: str) -> tuple:
 
 # ---------------------------------------------------------------- SIGNAL ENGINE
 class SignalEngine:
-    """Maximum-confluence signals only (BTC). Score /12, fire at >= 10.
-    Tracked to outcome publicly. No gold signals (no live gold tape).
-    v2: added cross-exchange confirmation + clear-path (whale-wall) factors,
-    and a liquidation-cascade pause gate in try_fire (risk-timing, not a
-    confluence opinion — avoids entering fresh into an active flush)."""
+    """Signals for BITCOIN and GOLD. Score /12 (Gold max /11 — no cross-ex factor).
+    Fire at >=10. Max 2/day per asset, 4h cooldown. News blackout respected.
+    BTC: cascade gate active. Gold: market-hours gate active."""
 
     def __init__(self):
         self.active = {}
@@ -390,7 +388,8 @@ class SignalEngine:
         return self.counts.get(k, 0) < MAX_SIGNALS_DAY
 
     def score(self, st: CandleStore, h4: dict, ctx: dict):
-        fm = flow_metrics(st)
+        fs = st if st.cvd_ticks else PROXIES.get(st.name, st)  # PAXG proxy for Gold
+        fm = flow_metrics(fs)
         if fm is None or fm["dir"] == "NEUTRAL":
             return None, 0, {}
         intra, wk = structure_read(st, h4)
@@ -408,9 +407,10 @@ class SignalEngine:
         if fm["regime"] == ("ACCUMULATION" if fm["dir"] == "BULL" else "DISTRIBUTION"):
             parts["regime confirms"] = 2
         vw = st.vwap()
-        if vw and ((st.price > vw and fm["dir"] == "BULL") or (st.price < vw and fm["dir"] == "BEAR")):
+        if vw and st.price and ((st.price > vw and fm["dir"] == "BULL") or
+                                 (st.price < vw and fm["dir"] == "BEAR")):
             parts["vwap side"] = 1
-        c = ctx.get("BITCOIN", {})
+        c = ctx.get(st.name, {})                # asset-specific context, not always BITCOIN
         f, bk = c.get("funding"), c.get("book")
         if f is not None:
             if (fm["dir"] == "BEAR" and f > 0.01) or (fm["dir"] == "BULL" and f < 0):
@@ -418,13 +418,13 @@ class SignalEngine:
         if bk is not None:
             if (fm["dir"] == "BULL" and bk > 0) or (fm["dir"] == "BEAR" and bk < 0):
                 parts["book supports"] = 1
-        # --- new factors (added with explicit owner permission on top of the original /10 rubric) ---
-        xex = CROSS_EX.get("BITCOIN")
-        if xex is not None and abs(xex.get("divergence_pct", 99)) < 0.15:
-            parts["cross-exchange confirms"] = 1
+        if st.name == "BITCOIN":               # cross-ex only for BTC (no Coinbase PAXG eq.)
+            xex = CROSS_EX.get("BITCOIN")
+            if xex is not None and abs(xex.get("divergence_pct", 99)) < 0.15:
+                parts["cross-exchange confirms"] = 1
         wall_key = "ask_wall" if fm["dir"] == "BULL" else "bid_wall"
         wall = c.get(wall_key)
-        if st.price and c.get("book") is not None:   # only score this if depth data actually loaded this cycle
+        if st.price and c.get("book") is not None:
             blocked = (wall is not None and wall.get("usd", 0) >= 100_000
                        and abs(wall["price"] - st.price) / st.price < 0.003)
             if not blocked:
@@ -433,17 +433,20 @@ class SignalEngine:
 
     def try_fire(self, st: CandleStore, h4: dict, ctx: dict):
         n = st.name
-        if n != "BITCOIN" or n in self.active or not self._allowed(n):
+        if n not in ("BITCOIN", "GOLD"):
+            return None
+        if n in self.active or not self._allowed(n):
+            return None
+        if n == "GOLD" and not gold_market_open():
             return None
         if news_blackout():
             return None
-        # liquidation-cascade pause: don't open a fresh position while $2M+ has just
-        # been force-liquidated in the last 60s (same threshold as the cascade alert) --
-        # active flushes mean abnormal volatility/slippage risk regardless of direction.
-        recent_liq_notional = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 60)
-        if recent_liq_notional > 2_000_000:
-            log.info(f"try_fire: skipped, ${recent_liq_notional:,.0f} liquidated in last 60s")
-            return None
+        # cascade gate — BTC only (LIQUIDATIONS stream is BTCUSDT futures)
+        if n == "BITCOIN":
+            recent_liq = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 60)
+            if recent_liq > 2_000_000:
+                log.info(f"try_fire {n}: skipped — ${recent_liq:,.0f} cascading")
+                return None
         d, score, parts = self.score(st, h4, ctx)
         if d is None or score < SIGNAL_MIN_SCORE:
             return None
@@ -462,22 +465,13 @@ class SignalEngine:
         k = now_eat().strftime("%Y-%m-%d")
         self.counts[k] = self.counts.get(k, 0) + 1
         self.last_fire[n] = time.time()
-        why = " · ".join(parts.keys())
         arrow = "▲ LONG" if d == "BULL" else "▼ SHORT"
-        side = "long" if d == "BULL" else "short"
-        lean = "bullish" if d == "BULL" else "bearish"
-        opener = random.choice([
-            f"Tape's leaning hard {lean} and structure's backing it up.",
-            f"Flow, structure, and positioning are all lined up on the {side} side here.",
-            f"This one's been building for a while — taking it {side}.",
-            f"Clean read. Book, flow, and structure all agree — going {side}.",
-        ])
-        return (f"🎯 <b>{n} · A+ SETUP · {arrow}</b>\n"
-                f"{opener}\n"
-                f"Confluence <b>{score}/{SIGNAL_MAX_SCORE}</b>\n"
+        why = " · ".join(parts.keys())
+        max_s = SIGNAL_MAX_SCORE if n == "BITCOIN" else SIGNAL_MAX_SCORE - 1
+        return (f"🎯 <b>{n} · {arrow}</b>\n"
                 f"Entry {fp(entry, n)} · SL {fp(sl, n)} · TP1 {fp(tp1, n)} · TP2 {fp(tp2, n)}\n"
-                f"<i>{why}</i>\n\n"
-                f"Educational — not financial advice. Risk only what you can lose.")
+                f"Score {score}/{max_s} · {why}\n\n"
+                f"<i>Educational. Not financial advice.</i>")
 
     def track(self, st: CandleStore) -> list:
         msgs = []
@@ -494,33 +488,18 @@ class SignalEngine:
         if hit_sl:
             del self.active[n]
             self.record["sl"] += 1
-            line = random.choice([
-                "Structure invalidated — stopped out clean.",
-                "Didn't work out. Stopped, no argument.",
-                "Invalidated. Taking the loss and standing down.",
-            ])
-            return [f"❌ <b>{n} · SIGNAL CLOSED — SL HIT</b>\n"
-                    f"{line} Desk stands down for {SIGNAL_COOLDOWN//3600}h.\n\n<i>{BRAND}</i>"]
+            return [f"❌ <b>{n} · STOPPED</b> {fp(sig['sl'], n)}\n"
+                    f"Invalidated. Next window in {SIGNAL_COOLDOWN//3600}h.\n\n<i>{BRAND}</i>"]
         if hit_tp1 and not sig["tp1_hit"]:
             sig["tp1_hit"] = True
             self.record["tp1"] += 1
-            line = random.choice([
-                "First target down.",
-                "TP1 in the bag.",
-                "Booked the first target.",
-            ])
-            return [f"✅ <b>{n} · TP1 HIT</b> — {fp(sig['tp1'], n)}\n"
-                    f"{line} TP2 {fp(sig['tp2'], n)} still open — trail your stop.\n\n<i>{BRAND}</i>"]
+            return [f"✅ <b>{n} · TP1 ✓</b> {fp(sig['tp1'], n)}\n"
+                    f"First target done. Trail stop to TP2 {fp(sig['tp2'], n)}.\n\n<i>{BRAND}</i>"]
         if sig["tp1_hit"] and hit_tp2:
             del self.active[n]
             self.record["tp2"] += 1
-            line = random.choice([
-                "Full target complete. Clean trade.",
-                "Both targets hit — that's the whole move.",
-                "Ran it all the way to TP2.",
-            ])
-            return [f"🏆 <b>{n} · TP2 HIT — FULL TARGET COMPLETE</b> · {fp(sig['tp2'], n)}\n"
-                    f"{line}\n\n<i>{BRAND}</i>"]
+            return [f"🏆 <b>{n} · TP2 ✓</b> {fp(sig['tp2'], n)}\n"
+                    f"Full trade done.\n\n<i>{BRAND}</i>"]
         return []
 
     def record_line(self) -> str:
@@ -555,45 +534,27 @@ class AlertEngine:
 
         if "flow_dir" in S and S["flow_dir"] != fm["dir"] and fm["dir"] != "NEUTRAL" \
                 and fm["ones1h"] >= MIN_ONESIDED_ALERT and self._cool(n, "flip", ALERT_COOLDOWN):
-            new_dir = DIR_WORD[fm["dir"]].lower()
             pct = fm["ones1h"] * 100
-            conv = fm["conv"].lower()
-            out.append(random.choice([
-                f"🔁 <b>{n} · FLOW FLIP — {DIR_WORD[fm['dir']]}</b>\n"
-                f"1h tape just turned {new_dir}. One-sidedness {pct:.0f}%, {conv} conviction @ {fp(st.price, n)}. "
-                f"This isn't noise — something shifted on the tape.",
-
-                f"🔁 <b>{n} · TAPE TURNED {DIR_WORD[fm['dir']]}</b>\n"
-                f"Flow direction flipped. 1h CVD now {new_dir} with {pct:.0f}% one-sidedness ({conv}) "
-                f"@ {fp(st.price, n)}. Watch for follow-through.",
-
-                f"🔁 <b>{n} · FLOW REVERSAL</b>\n"
-                f"Aggressor tape switched {new_dir} @ {fp(st.price, n)} — {pct:.0f}% one-sided on the hour, "
-                f"{conv} conviction. New direction to respect until proven otherwise.",
-            ]) + f"\n\n<i>{BRAND}</i>")
+            out.append(
+                f"🔁 <b>FLOW FLIP · {n}</b>\n"
+                f"Tape turned {DIR_WORD[fm['dir']].lower()} @ {fp(st.price, n)} · "
+                f"{pct:.0f}% one-sided · {fm['conv'].lower()} conviction.\n\n<i>{BRAND}</i>"
+            )
         S["flow_dir"] = fm["dir"]
 
         vw = st.vwap()
         if vw and st.price:
             dev = (st.price - vw) / vw * 100
-            if st.price > vw * (1 + VWAP_DEV_MIN / 100):
-                side = "above"
-            elif st.price < vw * (1 - VWAP_DEV_MIN / 100):
-                side = "below"
-            else:
-                side = S.get("vwap_side", "above")
+            side = "above" if st.price > vw * (1 + VWAP_DEV_MIN / 100) else \
+                   "below" if st.price < vw * (1 - VWAP_DEV_MIN / 100) else \
+                   S.get("vwap_side", "above")
             if S.get("vwap_side") and S["vwap_side"] != side and self._cool(n, "vwap", 600):
-                confirming = (fm["c1h"] > 0) == (side == "above")
-                flow_note = "flow confirming" if confirming else "flow NOT confirming — watch for fade"
-                out.append(random.choice([
-                    f"📍 <b>{n} · VWAP CROSS</b>\n"
-                    f"Price crossed {side} session VWAP at {fp(vw, n)} (dev {abs(dev):.2f}%). "
-                    f"{flow_note.capitalize()}.",
-
-                    f"📍 <b>{n} · PRICE CROSSED VWAP</b>\n"
-                    f"Now {side} session VWAP {fp(vw, n)}, {abs(dev):.2f}% deviation. "
-                    f"{flow_note.capitalize()}.",
-                ]) + f"\n\n<i>{BRAND}</i>")
+                confirm = (fm["c1h"] > 0) == (side == "above")
+                out.append(
+                    f"📍 <b>VWAP CROSS · {n}</b>\n"
+                    f"Price {side} VWAP {fp(vw, n)} ({abs(dev):.2f}% dev) · "
+                    f"{'flow confirms' if confirm else 'flow NOT confirming — watch for fade'}.\n\n<i>{BRAND}</i>"
+                )
             S["vwap_side"] = side
         return out
 
@@ -632,52 +593,30 @@ class ManipulationEngine:
         lc = d5.iloc[-2]
         sw_hi, sw_lo = float(prior.h.max()), float(prior.l.min())
         if lc.h > sw_hi and lc.c < sw_hi and self._cool(n, "hunt_hi", 1800):
-            out.append(random.choice([
-                f"🪤 <b>{n} · STOP HUNT — HIGH SIDE</b>\n"
-                f"Wick punched through {fp(sw_hi, n)} and closed straight back below. "
-                f"Buy-side stops grabbed above the level. Don't chase this — they hunted, not broke.",
-
-                f"🪤 <b>{n} · LIQUIDITY GRAB ABOVE</b>\n"
-                f"5m candle spiked above {fp(sw_hi, n)}, closed back under. "
-                f"Classic stop hunt on the highs. Watch for downside now that they've cleared the buy orders.",
-            ]) + f"\n\n<i>{BRAND}</i>")
+            out.append(
+                f"🪤 <b>STOP HUNT · {n}</b>\n"
+                f"Wick above {fp(sw_hi, n)}, closed back under. Buy stops grabbed — not a real break.\n\n<i>{BRAND}</i>"
+            )
         elif lc.l < sw_lo and lc.c > sw_lo and self._cool(n, "hunt_lo", 1800):
-            out.append(random.choice([
-                f"🪤 <b>{n} · STOP HUNT — LOW SIDE</b>\n"
-                f"Wick flushed through {fp(sw_lo, n)} and closed back above. "
-                f"Sell-side stops swept. Flush-and-reclaim pattern — don't sell the low.",
-
-                f"🪤 <b>{n} · LIQUIDITY GRAB BELOW</b>\n"
-                f"5m wick pierced {fp(sw_lo, n)}, snapped straight back above. "
-                f"Lows hunted, sell-stops cleared. Market may push higher now that the orders are filled.",
-            ]) + f"\n\n<i>{BRAND}</i>")
+            out.append(
+                f"🪤 <b>STOP HUNT · {n}</b>\n"
+                f"Wick below {fp(sw_lo, n)}, snapped back above. Sell stops swept — don't sell the low.\n\n<i>{BRAND}</i>"
+            )
 
         # ---- 2. FAKE BREAKOUT
         if fm is not None:
             if lc.c > sw_hi and float(d5.c.iloc[-1]) < sw_hi and self._cool(n, "fake_hi", 1800):
-                confirm = fm["c15"] > 0
-                note = "flow backed the break but it failed anyway — unusual, stay sharp" if confirm \
-                    else "CVD didn't confirm. Engineered break, not a real one"
-                out.append(random.choice([
-                    f"🎭 <b>{n} · FAKE BREAKOUT</b>\n"
-                    f"Broke above {fp(sw_hi, n)}, couldn't hold it, snapped back inside. "
-                    f"{note}.",
-
-                    f"🎭 <b>{n} · FAILED BREAK ABOVE {fp(sw_hi, n)}</b>\n"
-                    f"Price pushed through the level then immediately rejected. {note}.",
-                ]) + f"\n\n<i>{BRAND}</i>")
+                cvd_note = "CVD didn't confirm" if fm["c15"] <= 0 else "flow backed it but still failed"
+                out.append(
+                    f"🎭 <b>FAKE BREAKOUT · {n}</b>\n"
+                    f"Broke {fp(sw_hi, n)}, snapped back. {cvd_note}. Trap.\n\n<i>{BRAND}</i>"
+                )
             elif lc.c < sw_lo and float(d5.c.iloc[-1]) > sw_lo and self._cool(n, "fake_lo", 1800):
-                confirm = fm["c15"] < 0
-                note = "flow backed the break but it failed anyway — stay sharp" if confirm \
-                    else "CVD didn't confirm. Engineered break"
-                out.append(random.choice([
-                    f"🎭 <b>{n} · FAKE BREAKDOWN</b>\n"
-                    f"Broke below {fp(sw_lo, n)}, snapped back above. "
-                    f"{note}.",
-
-                    f"🎭 <b>{n} · FAILED BREAK BELOW {fp(sw_lo, n)}</b>\n"
-                    f"Breakdown attempt rejected, price reclaimed the level. {note}.",
-                ]) + f"\n\n<i>{BRAND}</i>")
+                cvd_note = "CVD didn't confirm" if fm["c15"] >= 0 else "flow backed it but still failed"
+                out.append(
+                    f"🎭 <b>FAKE BREAKDOWN · {n}</b>\n"
+                    f"Broke below {fp(sw_lo, n)}, reclaimed. {cvd_note}. Trap.\n\n<i>{BRAND}</i>"
+                )
 
         # ---- 3. SQUEEZE TRAP
         recent = [p for t, s, p in st.cvd_ticks if t >= time.time() - 120]
@@ -687,26 +626,16 @@ class ManipulationEngine:
             max_p = max(recent)
             if abs(min_p - last_p) / max(last_p, 1e-9) < 0.0008 and (max_p - min_p) / min_p > 0.004 \
                     and fm["c1h"] > 0 and self._cool(n, "squeeze_lo", 1800):
-                out.append(random.choice([
-                    f"🧨 <b>{n} · SQUEEZE TRAP — LONGS FLUSHED</b>\n"
-                    f"Fast drop to {fp(min_p, n)}, instantly reclaimed to {fp(last_p, n)}. "
-                    f"Leverage cascade triggered and absorbed. 1h flow still bullish — the flush was a trap.",
-
-                    f"🧨 <b>{n} · LONG SQUEEZE ABSORBED</b>\n"
-                    f"Flushed to {fp(min_p, n)} in seconds, snapped back to {fp(last_p, n)}. "
-                    f"Weak longs shaken out, strong hands absorbed the sell. Tape still bullish underneath.",
-                ]) + f"\n\n<i>{BRAND}</i>")
+                out.append(
+                    f"🧨 <b>LONG SQUEEZE · {n}</b>\n"
+                    f"Flushed to {fp(min_p, n)}, back to {fp(last_p, n)}. Weak hands out. Tape still bullish.\n\n<i>{BRAND}</i>"
+                )
             elif abs(max_p - last_p) / max(last_p, 1e-9) < 0.0008 and (max_p - min_p) / min_p > 0.004 \
                     and fm["c1h"] < 0 and self._cool(n, "squeeze_hi", 1800):
-                out.append(random.choice([
-                    f"🧨 <b>{n} · SQUEEZE TRAP — SHORTS SQUEEZED</b>\n"
-                    f"Spiked to {fp(max_p, n)}, instantly rejected to {fp(last_p, n)}. "
-                    f"Shorts squeezed out, tape still bearish. The spike was the trap.",
-
-                    f"🧨 <b>{n} · SHORT SQUEEZE REJECTED</b>\n"
-                    f"Ran stops to {fp(max_p, n)}, reversed hard to {fp(last_p, n)}. "
-                    f"Shorts cleared, 1h flow remains bearish. Move was designed to hunt stops.",
-                ]) + f"\n\n<i>{BRAND}</i>")
+                out.append(
+                    f"🧨 <b>SHORT SQUEEZE · {n}</b>\n"
+                    f"Spiked to {fp(max_p, n)}, back to {fp(last_p, n)}. Shorts cleared. Tape still bearish.\n\n<i>{BRAND}</i>"
+                )
 
         # ---- 4. ABSORPTION
         if fm is not None:
@@ -718,46 +647,30 @@ class ManipulationEngine:
                     lo_lvl = fp(float(flat.l.min()), n)
                     hi_lvl = fp(float(flat.h.max()), n)
                     if fm["c15"] > 0 and self._cool(n, "absorb_bid", 1800):
-                        out.append(random.choice([
-                            f"🛡️ <b>{n} · ABSORPTION AT BID</b>\n"
-                            f"Price locked in {lo_lvl}–{hi_lvl} while the tape is actively buying "
-                            f"({fm['c15']:+,.0f} CVD 15m). Passive sellers absorbing every buy. "
-                            f"Breakout likely when supply exhausts.",
-
-                            f"🛡️ <b>{n} · BID DEFENDED</b>\n"
-                            f"Tight range {lo_lvl}–{hi_lvl}, 15m tape buying into it ({fm['c15']:+,.0f} CVD). "
-                            f"Large passive seller sitting here. Watch for exhaustion break.",
-                        ]) + f"\n\n<i>{BRAND}</i>")
+                        out.append(
+                            f"🛡️ <b>ABSORPTION · {n}</b>\n"
+                            f"Pinned {lo_lvl}–{hi_lvl}, tape buying ({fm['c15']:+,.0f} CVD 15m). "
+                            f"Passive seller capping. Watch for exhaustion break.\n\n<i>{BRAND}</i>"
+                        )
                     elif fm["c15"] < 0 and self._cool(n, "absorb_ask", 1800):
-                        out.append(random.choice([
-                            f"🛡️ <b>{n} · ABSORPTION AT OFFER</b>\n"
-                            f"Price capped {lo_lvl}–{hi_lvl} while the tape is actively selling "
-                            f"({fm['c15']:+,.0f} CVD 15m). Passive buyers absorbing the selling pressure.",
+                        out.append(
+                            f"🛡️ <b>ABSORPTION · {n}</b>\n"
+                            f"Capped {lo_lvl}–{hi_lvl}, tape selling ({fm['c15']:+,.0f} CVD 15m). "
+                            f"Passive buyer defending. Key level.\n\n<i>{BRAND}</i>"
+                        )
 
-                            f"🛡️ <b>{n} · OFFER DEFENDED</b>\n"
-                            f"Stuck in {lo_lvl}–{hi_lvl}, tape selling into it ({fm['c15']:+,.0f} CVD 15m). "
-                            f"Large passive buyer absorbing all the supply. Key level.",
-                        ]) + f"\n\n<i>{BRAND}</i>")
-
-        # ---- 5. LIQUIDATION CASCADE (Binance futures forced-order stream)
+        # ---- 5. LIQUIDATION CASCADE
         recent_liqs = [x for x in LIQUIDATIONS if x[0] >= time.time() - 60 and x[1] == "BTCUSDT"]
         if len(recent_liqs) >= 5:
             total_notional = sum(x[5] for x in recent_liqs)
             if total_notional > 2_000_000 and self._cool(n, "liq_cascade", 900):
                 longs_liq = sum(x[5] for x in recent_liqs if x[2] == "SELL")
-                shorts_liq = sum(x[5] for x in recent_liqs if x[2] == "BUY")
-                skew = "longs" if longs_liq > shorts_liq else "shorts"
-                skew_amt = max(longs_liq, shorts_liq)
-                out.append(random.choice([
-                    f"💥 <b>{n} · LIQUIDATION CASCADE</b>\n"
-                    f"${total_notional:,.0f} force-liquidated in 60s ({len(recent_liqs)} orders). "
-                    f"{skew.upper()} getting wrecked — ${skew_amt:,.0f} of that. "
-                    f"Binance futures forced-order stream, live. Abnormal vol — no new entries inside this.",
-
-                    f"💥 <b>{n} · FORCED LIQUIDATIONS — ${total_notional:,.0f}</b>\n"
-                    f"{len(recent_liqs)} forced orders in the last 60s. {skew.capitalize()} taking the hit "
-                    f"(${skew_amt:,.0f}). Active cascade in progress — desk pauses new signals.",
-                ]) + f"\n\n<i>{BRAND}</i>")
+                skew = "longs" if longs_liq > total_notional / 2 else "shorts"
+                out.append(
+                    f"💥 <b>CASCADE · {n}</b>\n"
+                    f"${total_notional/1e6:.1f}M force-liquidated in 60s · {skew} taking the hit. "
+                    f"No new entries inside this.\n\n<i>{BRAND}</i>"
+                )
         return out
 
 # Single instantiation point — everything below can safely reference these.
@@ -1225,53 +1138,26 @@ def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
 
 def build_daily_outlook(stores, proxies, h4) -> str:
     t = now_eat()
-    day_openers = [
-        f"Good morning. Here's the desk read for {t.strftime('%A')}.",
-        f"Morning brief — {t.strftime('%A %d %B')}. Here's where everything stands.",
-        f"Start of day — {t.strftime('%A')}. Full read below.",
-    ]
-    lines = [f"🌅 <b>BRAX FX · DAILY OUTLOOK — {t.strftime('%A, %d %B %Y')}</b>\n"
-             + random.choice(day_openers) + "\n"]
+    lines = [f"🌅 <b>DAILY OUTLOOK · {t.strftime('%a %d %b').upper()}</b>\n"]
     for st in stores:
         n = st.name
         if n == "GOLD" and not gold_market_open():
             continue
         intra, wk = structure_read(st, h4)
-        fm = flow_metrics(st if st.cvd_ticks else proxies.get("GOLD", st))
-        price_str = fp(st.price, n) if st.price else "no data yet"
-        vwap_str = fp(st.vwap(), n) if st.vwap() else "forming"
-        lines.append(f"<b>{n}</b> — {price_str}")
-        if fm and fm["dir"] != "NEUTRAL":
-            aligned = intra == fm["dir"]
-            if aligned:
-                lines.append(random.choice([
-                    f"Tape and structure are both {DIR_WORD[fm['dir']].lower()} — {fm['conv'].lower()} conviction "
-                    f"flow, {DIR_WORD[intra].lower()} 1h, {DIR_WORD[wk].lower()} 4h. "
-                    f"Pullbacks toward VWAP {vwap_str} are where the desk leans.",
-                    f"{fm['conv']} conviction {DIR_WORD[fm['dir']].lower()} tape backed by {DIR_WORD[intra].lower()} structure "
-                    f"on both timeframes. Regime: {fm['regime'].replace('-',' ').lower()}. "
-                    f"VWAP at {vwap_str} — that's the reference level today.",
-                    f"Clean alignment — {DIR_WORD[fm['dir']].lower()} flow ({fm['conv'].lower()} conviction), "
-                    f"{DIR_WORD[intra].lower()} 1h, {DIR_WORD[wk].lower()} weekly. "
-                    f"The desk respects the direction and waits for a tap of VWAP {vwap_str} before leaning in.",
-                ]))
-            else:
-                lines.append(random.choice([
-                    f"Flow is {DIR_WORD[fm['dir']].lower()} ({fm['conv'].lower()} conviction) but structure on the 1h "
-                    f"reads {DIR_WORD[intra].lower()} — disagreement means traps. Desk doesn't force a read here.",
-                    f"Tape and structure don't agree: {DIR_WORD[fm['dir']].lower()} flow vs {DIR_WORD[intra].lower()} "
-                    f"1h structure. When they split like this, we wait — traps live in disagreement.",
-                ]))
-        else:
-            lines.append(random.choice([
-                "Flow is balanced — neither side has conviction. Desk stays flat until one side commits.",
-                "No clean tape edge this morning. Waiting for flow to pick a side before calling anything.",
-            ]))
-        lines.append("")
-    lines.append(news_today_lines())
-    lines.append("\nHigh-impact releases get a 15-minute heads-up automatically. "
-                 "No signals fire inside the blackout window.\n")
-    lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
+        fs = st if st.cvd_ticks else proxies.get(n, st)
+        fm = flow_metrics(fs)
+        fl = fm["dir"] if fm else "NEUTRAL"
+        _, grade = agreement_full(intra, wk, fl)
+        price_str = fp(st.price, n) if st.price else "—"
+        vw = st.vwap()
+        vwap_str = f" · VWAP {fp(vw, n)}" if vw else ""
+        dir_str = DIR_WORD[fl] if fl != "NEUTRAL" else "Neutral"
+        conv_str = f" · {fm['conv'].lower()} conv" if fm and fl != "NEUTRAL" else ""
+        lines.append(f"<b>{n}</b>  {price_str}  ·  {dir_str} {grade}{conv_str}{vwap_str}")
+    news = news_today_lines()
+    if news.strip():
+        lines.append(f"\n{news.strip()}")
+    lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}")
     return "\n".join(lines) + footer()
 
 def confluence_score(st: CandleStore, proxies: dict, h4: dict) -> dict:
@@ -1375,128 +1261,85 @@ def build_now() -> str:
 
 def build_flow_report() -> str:
     t_str = now_eat().strftime("%H:%M EAT")
-    openers = [
-        f"📊 <b>TAPE READING — {t_str}</b>",
-        f"📊 <b>FLOW CHECK — {t_str}</b>",
-        f"📊 <b>LIVE FLOW — {t_str}</b>",
-    ]
-    lines = [random.choice(openers) + f"\n{BRAND}\n"]
+    lines = [f"📊 <b>FLOW · {t_str}</b>"]
     for st in STORES:
         fs = st if st.cvd_ticks else PROXIES.get(st.name, st)
         fm = flow_metrics(fs)
-        proxy_note = " (PAXG proxy)" if fs is not st else ""
         c = CTX.get(st.name, {})
-        price_str = fp(st.price, st.name) if st.price else "—"
-        asset_lines = [f"<b>{st.name}</b>{proxy_note}  {price_str}"]
-        if fm:
-            ones_1h = fm["ones1h"] * 100
-            conviction_note = {
-                "High": f"strong conviction — {ones_1h:.0f}% one-sided on the hour",
-                "Medium": f"moderate conviction — {ones_1h:.0f}% one-sided",
-                "Low": f"low conviction ({ones_1h:.0f}%) — treat carefully",
-            }.get(fm["conv"], fm["conv"])
-            regime_clean = fm["regime"].replace("-", " ").lower()
-            if fm["dir"] == "NEUTRAL":
-                asset_lines.append(f"⚪ Mixed tape — no clean directional edge. {regime_clean}.")
-            else:
-                asset_lines.append(f"{DIR_EMOJI[fm['dir']]} {DIR_WORD[fm['dir']].lower()} · {conviction_note} · {regime_clean}")
-            asset_lines.append(f"CVD  15m {fm['c15']:+,.0f}  ·  1h {fm['c1h']:+,.0f}")
+        price = fp(st.price, st.name) if st.price else "—"
+        if fm and fm["dir"] != "NEUTRAL":
+            _, acc = cvd_acceleration(fs)
+            acc_s = " · accel ↑" if "accel" in acc else (" · fading ↓" if "fading" in acc else "")
+            row1 = f"<b>{st.name}</b>  {price}  ·  {DIR_WORD[fm['dir']]} · {fm['conv'].lower()} conv{acc_s}"
+            row2 = f"CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f}"
         else:
-            asset_lines.append("⚪ Flow building — no read yet")
-        # Book imbalance
-        book = c.get("book")
-        if book is not None:
-            bk_side = "bid" if book > 0 else "ask"
-            asset_lines.append(f"Book  {bk_side}-heavy {abs(book):.1f}%")
-        # Whale walls
-        bid_w = c.get("bid_wall")
-        ask_w = c.get("ask_wall")
+            row1 = f"<b>{st.name}</b>  {price}  ·  warming up"
+            row2 = ""
+        bid_w, ask_w = c.get("bid_wall"), c.get("ask_wall")
+        walls = ""
         if bid_w and ask_w:
-            asset_lines.append(
-                f"Walls  bid ${bid_w['usd']:,} @ {fp(bid_w['price'], st.name)}  ·  "
-                f"ask ${ask_w['usd']:,} @ {fp(ask_w['price'], st.name)}"
-            )
-        # Cross-exchange (BTC only)
-        if st.name == "BITCOIN":
-            xex = CROSS_EX.get("BITCOIN")
-            if xex and time.time() - xex.get("ts", 0) < 120:
-                div = xex["divergence_pct"]
-                if abs(div) >= 0.1:
-                    asset_lines.append(f"⚠️ Venue gap  Binance {fp(xex['binance'], 'BITCOIN')} vs Coinbase {fp(xex['coinbase'], 'BITCOIN')} ({div:+.3f}%)")
-                else:
-                    asset_lines.append(f"Cross-ex  Binance vs Coinbase  in line ({div:+.3f}%) ✓")
-        lines.append("\n".join(asset_lines))
-    # Liquidation context
-    liq_1h = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 3600)
-    liq_5m = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 300)
-    if liq_1h > 1_000_000:
-        longs_liq = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 3600 and x[2] == "SELL")
-        shorts_liq = liq_1h - longs_liq
-        skew = "longs" if longs_liq > shorts_liq else "shorts"
-        lines.append(f"⚡ Forced liquidations (1h)  ${liq_1h:,.0f} — {skew} taking the brunt"
-                     + (f"  ·  last 5m ${liq_5m:,.0f}" if liq_5m > 100_000 else ""))
+            xex = ""
+            if st.name == "BITCOIN":
+                x = CROSS_EX.get("BITCOIN")
+                if x and time.time() - x.get("ts", 0) < 120:
+                    xex = "  ⚠️ gap" if abs(x["divergence_pct"]) >= 0.15 else "  CB ✓"
+            walls = (f"Bid ${bid_w['usd']//1000}k@{fp(bid_w['price'], st.name)}  "
+                     f"Ask ${ask_w['usd']//1000}k@{fp(ask_w['price'], st.name)}{xex}")
+        liq_1h = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 3600) if st.name == "BITCOIN" else 0
+        liq_s = f"  ·  liqs 1h ${liq_1h/1e6:.1f}M" if liq_1h > 500_000 else ""
+        block = "\n".join(x for x in [row1, row2, walls + liq_s] if x)
+        lines.append(block)
     return "\n\n".join(lines) + footer()
 
 def build_signal_card() -> str:
-    lines = [header("SIGNAL DESK")]
-    lines.append(SIGNAL_ENGINE.record_line())
-    lines.append(f"Today: {SIGNAL_ENGINE.counts.get(now_eat().strftime('%Y-%m-%d'), 0)}/{MAX_SIGNALS_DAY} · "
-                 f"min confluence {SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE}")
+    t_str = now_eat().strftime("%H:%M EAT")
+    lines = [f"📊 <b>SIGNALS · {t_str}</b>\n"]
     if SIGNAL_ENGINE.active:
         for n, s in SIGNAL_ENGINE.active.items():
             arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
-            lines.append(f"\n🎯 {n} {arrow} · {s['score']}/{SIGNAL_MAX_SCORE}")
+            age_min = int((time.time() - s["t"]) / 60)
+            max_s = SIGNAL_MAX_SCORE if n == "BITCOIN" else SIGNAL_MAX_SCORE - 1
+            lines.append(f"<b>{n} · {arrow}</b>  {s['score']}/{max_s}  ·  open {age_min}min")
             lines.append(f"Entry {fp(s['entry'], n)} · SL {fp(s['sl'], n)}")
             lines.append(f"TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
     else:
-        lines.append(f"\nNo open signal — desk fires only at ≥{SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE} confluence.")
+        lines.append(f"No open signals · bar ≥{SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE}")
+    today = SIGNAL_ENGINE.counts.get(now_eat().strftime("%Y-%m-%d"), 0)
+    lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}  ·  Today {today}/{MAX_SIGNALS_DAY}")
     return "\n".join(lines) + footer()
 
 def build_health() -> str:
     t_str = now_eat().strftime("%H:%M EAT")
-    lines = [f"⚙️ <b>DESK STATUS — {t_str}</b>\n{BRAND}\n"]
-    # Feed status per asset
-    feed_lines = []
+    lines = [f"⚙️ <b>STATUS · {t_str}</b>\n"]
     for st in STORES:
         age = st.data_age()
         ok = age < STALE_FEED_SEC
-        status = "🟢 live" if ok else f"🔴 stale — {int(age/60)}m old"
-        price_str = fp(st.price, st.name) if st.price else "no data"
-        feed_lines.append(f"  {st.name}  {price_str}  ·  {st.source}  ·  {status}")
-    lines.append("Feeds:\n" + "\n".join(feed_lines))
-    # Cross-exchange
+        lines.append(f"{'🟢' if ok else '🔴'} <b>{st.name}</b>  "
+                     f"{fp(st.price, st.name) if st.price else '—'}  ·  {st.source}")
     xex = CROSS_EX.get("BITCOIN")
     if xex and time.time() - xex.get("ts", 0) < 120:
         div = xex["divergence_pct"]
-        div_flag = "✓" if abs(div) < 0.1 else "⚠️ dislocation"
-        lines.append(f"Cross-ex  Binance {fp(xex['binance'], 'BITCOIN')} vs Coinbase {fp(xex['coinbase'], 'BITCOIN')}  {div:+.3f}%  {div_flag}")
-    # Liquidations
+        lines.append(f"Cross-ex {'⚠️ gap' if abs(div) >= 0.15 else 'CB ✓'}  {div:+.3f}%")
     liq_5m = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 300)
     liq_1h = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 3600)
-    lines.append(f"Forced liquidations  5m ${liq_5m:,.0f}  ·  1h ${liq_1h:,.0f}")
-    # State
-    nb = "🔴 ACTIVE" if news_blackout() else "🟢 clear"
-    sess = session_name() or "CLOSED"
-    lines.append(f"Session  {sess}  ·  News blackout  {nb}  ·  Events loaded  {len(NEWS['events'])}")
-    if not gold_market_open():
-        lines.append(f"Gold market closed — reopens {gold_next_open_eat().strftime('%a %H:%M')} EAT")
-    # Signals
-    open_sigs = list(SIGNAL_ENGINE.active.keys())
-    lines.append(f"Open signals  {', '.join(open_sigs) if open_sigs else 'none'}")
+    lines.append(f"Liqs  5m ${liq_5m/1e3:.0f}k  ·  1h ${liq_1h/1e6:.2f}M")
+    nb = "🔴 ACTIVE" if news_blackout() else "clear"
+    lines.append(f"Session {session_name() or 'CLOSED'}  ·  News {nb}")
+    sigs = list(SIGNAL_ENGINE.active.keys()) or ["none"]
+    lines.append(f"Open: {', '.join(sigs)}")
     lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
-    return "\n\n".join(lines) + footer()
+    return "\n".join(lines) + footer()
 
 HELP_TEXT = (
     "🤖 <b>BRAX FX · FLOW & SIGNAL DESK</b>\n\n"
-    "/now — live desk snapshot (price, flow, structure, book)\n"
-    "/flow — aggressor tape & CVD breakdown\n"
-    "/dayoutlook — today's full market outlook\n"
-    "/signal — open signals + track record\n"
-    "/sotd — signal of the day (top confluence bias)\n"
-    "/health — feed status & data sources\n\n"
-    "Auto-posts: daily outlook 07:00 · session opens · hourly flow · "
-    "manipulation alerts · "
-    f"A+ signals ≥{SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE} confluence with charts · news warnings 15min ahead.\n\n"
+    "/now — live desk snapshot\n"
+    "/flow — tape & CVD\n"
+    "/dayoutlook — daily bias\n"
+    "/sotd — signal of the day\n"
+    "/signal — open signals + record\n"
+    "/health — feed status\n\n"
+    "Auto: 07:00 daily · session opens · hourly flow · alerts · signals\n"
+    "Signals: BTC + Gold · ≥10/12 · max 2/day · 4h cooldown\n\n"
     f"🎯 {SIGNAL_ENGINE.record_line()}\n\n<i>{FOOT}</i>"
 )
 
@@ -1572,27 +1415,11 @@ async def signal_of_day_worker(stores, proxies, h4):
 
 async def session_worker(stores, proxies, h4, ctx):
     opened = set()
-    SESSION_CONTEXT = {
-        "ASIA": [
-            "Thin volume session — liquidity traps are common here. Noise is higher than it looks.",
-            "Asia open. Low vol, wide spreads early. What happens here often reverses in London.",
-            "Tokyo session live. Respect the noise. The real directional read comes with European open.",
-        ],
-        "LONDON": [
-            "London's in. Liquidity just stepped up — this is where real directional moves tend to start.",
-            "European open. Spreads tighten, volume picks up fast. Take the tape seriously now.",
-            "London session live. First high-liquidity window of the day. Desk fully on.",
-        ],
-        "NEW YORK": [
-            "New York is here. Highest volume session. If there's a move today, this is where it comes.",
-            "NY open. Overlap with London for the next few hours — peak liquidity, most reliable tape.",
-            "New York live. Data releases, institutional flows, the works. Most important session of the day.",
-        ],
-        "NY PM": [
-            "NY afternoon. London's closing out — watch for position squaring and thinning liquidity.",
-            "Afternoon NY. Direction from this morning either continues or gets faded here.",
-            "NY PM open. Volume drops as London exits. Better for managing trades than opening new ones.",
-        ],
+    SESSION_NOTE = {
+        "ASIA":     "Thin volume. Respect the noise.",
+        "LONDON":   "Liquidity up. Take the tape seriously.",
+        "NEW YORK": "Highest volume. Moves happen here.",
+        "NY PM":    "Volume fading. Manage trades, avoid new setups.",
     }
     while True:
         t = now_eat()
@@ -1601,30 +1428,19 @@ async def session_worker(stores, proxies, h4, ctx):
             opened.add(t.strftime("%Y%m%d") + s)
             if len(opened) > 20:
                 opened = set(list(opened)[-10:])
-            context_line = random.choice(SESSION_CONTEXT.get(s, ["Session live."]))
-            lines = [f"🕐 <b>{s} SESSION — {t.strftime('%H:%M EAT')}</b>\n{context_line}\n"]
+            note = SESSION_NOTE.get(s, "Session live.")
+            lines = [f"🔔 <b>{s} · {t.strftime('%H:%M EAT')}</b>\n{note}\n"]
             for st in stores:
                 if st.name == "GOLD" and not gold_market_open():
-                    lines.append("GOLD — market closed, no read.")
                     continue
+                fs = st if st.cvd_ticks else proxies.get(st.name, st)
+                fm = flow_metrics(fs)
                 intra, wk = structure_read(st, h4)
-                fm = flow_metrics(st if st.cvd_ticks else proxies.get(st.name, st))
+                _, grade = agreement_full(intra, wk, fm["dir"] if fm else "NEUTRAL")
                 price_str = fp(st.price, st.name) if st.price else "—"
-                ctx_c = ctx.get(st.name, {})
-                book = ctx_c.get("book")
-                book_str = ""
-                if book is not None:
-                    book_str = f" · book {'bid' if book > 0 else 'ask'}-heavy {abs(book):.1f}%"
-                if fm:
-                    lines.append(
-                        f"<b>{st.name}</b> {price_str}\n"
-                        f"{DIR_EMOJI[fm['dir']]} {DIR_WORD[fm['dir']].lower()} flow, {fm['conv'].lower()} conviction "
-                        f"· structure {DIR_WORD[intra].lower()}{book_str}"
-                    )
-                else:
-                    lines.append(f"<b>{st.name}</b> {price_str} — flow warming up · structure {DIR_WORD[intra].lower()}")
-            lines.append("\n/now for full read · /signal for open trades")
-            await tg_send("\n\n".join(lines) + footer())
+                dir_str = DIR_WORD[fm["dir"]] if fm and fm["dir"] != "NEUTRAL" else "Neutral"
+                lines.append(f"<b>{st.name}</b>  {price_str}  ·  {dir_str} {grade}")
+            await tg_send("\n".join(lines) + footer())
         if not s and now_eat().hour >= 21:
             opened = set()
         await asyncio.sleep(60)
@@ -1635,26 +1451,17 @@ async def close_worker(stores):
         t = now_eat()
         if t.hour == 21 and 0 <= t.minute < 2 and sent_for != t.date():
             sent_for = t.date()
-            day_str = t.strftime("%A %d %b")
-            opener = random.choice([
-                f"NY close. That's the day — {day_str}.",
-                f"Books closing. Day done — {day_str}.",
-                f"NY session wrapped. End of {day_str}.",
-            ])
-            lines = [f"🌙 <b>NY CLOSE — {t.strftime('%H:%M EAT')}</b>\n{opener}\n"]
+            lines = [f"🌙 <b>NY CLOSE · {t.strftime('%d %b')}</b>\n"]
             for st in stores:
                 df = st.df("1h", 24)
                 if not df.empty and st.price:
                     hi, lo = float(df.h.max()), float(df.l.min())
-                    rng_pct = (hi - lo) / lo * 100 if lo else 0
-                    close_pos = (st.price - lo) / (hi - lo) * 100 if hi != lo else 50
-                    pos_word = "near highs" if close_pos > 70 else ("near lows" if close_pos < 30 else "mid-range")
-                    lines.append(
-                        f"<b>{st.name}</b> closing at {fp(st.price, st.name)}\n"
-                        f"24h range: {fp(lo, st.name)} – {fp(hi, st.name)} ({rng_pct:.1f}% move) · {pos_word}"
-                    )
+                    pos = (st.price - lo) / (hi - lo) * 100 if hi != lo else 50
+                    pos_w = "near highs" if pos > 70 else ("near lows" if pos < 30 else "mid-range")
+                    lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}  ·  {pos_w}  "
+                                 f"24h {fp(lo, st.name)}–{fp(hi, st.name)}")
             lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}")
-            await tg_send("\n\n".join(lines) + footer())
+            await tg_send("\n".join(lines) + footer())
             await asyncio.sleep(120)
         await asyncio.sleep(60)
 
@@ -1664,37 +1471,26 @@ async def weekend_worker(stores, h4):
         t = now_eat()
         if t.weekday() == 5 and t.hour == 10 and t.minute < 2 and sent_sat != t.date():
             sent_sat = t.date()
-            opener = random.choice([
-                "Weekly wrap. Here's where everything closed and what the range looked like.",
-                "Weekend review — 5-day picture across the desk.",
-                "Week's done. Let's look at what the tape delivered.",
-            ])
-            lines = [f"📋 <b>WEEKEND REVIEW — {t.strftime('%d %b %Y')}</b>\n{opener}\n"]
+            lines = [f"📋 <b>WEEK CLOSED · {t.strftime('%d %b')}</b>\n"]
             for st in stores:
                 df = st.df("1h", 120)
                 if len(df) >= 24 and st.price:
                     hi = float(df.tail(120).h.max())
                     lo = float(df.tail(120).l.min())
-                    rng_pct = (hi - lo) / lo * 100 if lo else 0
-                    close_pos = (st.price - lo) / (hi - lo) * 100 if hi != lo else 50
-                    pos_word = "closed near the weekly highs" if close_pos > 70 \
-                        else ("closed near the weekly lows" if close_pos < 30 else "closed mid-range")
-                    lines.append(
-                        f"<b>{st.name}</b> — {fp(st.price, st.name)}\n"
-                        f"5d range: {fp(lo, st.name)} – {fp(hi, st.name)} ({rng_pct:.1f}% week)\n"
-                        f"{pos_word}"
-                    )
-            lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}\nMarkets reopen Sunday. Watch for gap risk.")
-            await tg_send("\n\n".join(lines) + footer())
+                    pos = (st.price - lo) / (hi - lo) * 100 if hi != lo else 50
+                    pos_w = "near highs" if pos > 70 else ("near lows" if pos < 30 else "mid-range")
+                    lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}  ·  {pos_w}  "
+                                 f"5d {fp(lo, st.name)}–{fp(hi, st.name)}")
+            lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}\nReopen Sun 21:30 EAT. Watch for gap.")
+            await tg_send("\n".join(lines) + footer())
         if t.weekday() == 6 and t.hour == 21 and 30 <= t.minute < 32 and sent_sun != t.date():
             sent_sun = t.date()
-            gold_open = gold_next_open_eat().strftime("%H:%M EAT")
+            gold_t = gold_next_open_eat().strftime("%H:%M EAT")
             await tg_send(
-                f"🟢 <b>MARKETS REOPENING</b>\n"
-                f"Week's starting. Gold reopens {gold_open}. "
-                f"Gap risk is real — first 15–30 min after open the tape is noisy. "
-                f"Desk waits for the flow to settle before reading anything clean.\n\n"
-                f"BTC is already live 24/7. Flow reads resuming now.\n\n<i>{BRAND}</i>")
+                f"🟢 <b>MARKETS OPEN</b>\n"
+                f"BTC live. Gold opens {gold_t}.\n"
+                f"First 15min noisy — wait for flow to settle.\n\n<i>{BRAND}</i>"
+            )
         await asyncio.sleep(60)
 
 # ---------------------------------------------------------------- COMMANDS
