@@ -992,39 +992,48 @@ async def cross_exchange_worker(stores):
 # ---------------------------------------------------------------- NEWS
 NEWS = {"events": [], "announced": set()}
 
+IMPACT_EMOJI = {"High": "🔴", "Medium": "🟡", "Low": "⚪", "Holiday": "📅"}
+MAJOR_CCY    = {"USD","EUR","GBP","JPY","AUD","CAD","CHF","NZD"}   # show all, flag these
+
+async def _fetch_news_events() -> list:
+    """Fetch ForexFactory calendar — tries primary then CDN fallback.
+    Returns raw list of all events or empty list on failure."""
+    for url in (FF_CAL, FF_CAL_CDN):
+        try:
+            async with HTTP.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                ctype = r.headers.get("Content-Type", "")
+                if r.status == 429:
+                    log.warning(f"news: 429 from {url}")
+                    continue
+                if r.status != 200:
+                    log.warning(f"news: HTTP {r.status} from {url}")
+                    continue
+                if "json" not in ctype.lower():
+                    body = await r.text()
+                    log.warning(f"news: non-JSON from {url} ({ctype}): {body[:120]}")
+                    continue
+                evs = await r.json()
+                log.info(f"news: {len(evs)} raw events from {url}")
+                return evs if isinstance(evs, list) else []
+        except Exception as e:
+            log.warning(f"news: error fetching {url}: {e}")
+    return []
+
 async def news_worker():
+    # fetch immediately on startup, then every 30 min
     while True:
-        evs = None
-        for url in (FF_CAL, FF_CAL_CDN):
-            try:
-                async with HTTP.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    ctype = r.headers.get("Content-Type", "")
-                    if r.status == 429:
-                        log.warning(f"news: 429 from {url} — keeping {len(NEWS['events'])} cached")
-                        break
-                    if r.status != 200:
-                        log.warning(f"news: status {r.status} from {url}")
-                        continue
-                    if "json" not in ctype.lower():
-                        log.warning(f"news: non-JSON ({ctype}) from {url}")
-                        continue
-                    evs = await r.json()
-                    log.info(f"news: fetched {len(evs)} raw events from {url}")
-                    break
-            except Exception as e:
-                log.warning(f"news: fetch error from {url}: {e}")
-        if evs is not None and isinstance(evs, list):
-            # FF JSON uses 'country' (not 'currency') and 'impact' == 'High'
-            filtered = [e for e in evs
-                        if e.get("impact") == "High"
-                        and e.get("country") == "USD"]
-            NEWS["events"] = filtered
-            log.info(f"news: {len(filtered)} high-impact USD events this week "
-                     f"(from {len(evs)} total — filter: impact=High, country=USD)")
-            if not filtered:
-                # log a sample so we can debug field names if they change again
-                sample = evs[:3] if evs else []
-                log.warning(f"news: zero events passed filter — sample raw: {sample}")
+        evs = await _fetch_news_events()
+        if evs:
+            # keep everything — user sees all events, blackout only blocks High
+            # FF JSON uses 'country' (not 'currency') for the currency field
+            NEWS["events"] = [e for e in evs if e.get("country") in MAJOR_CCY
+                              or e.get("impact") == "High"]
+            high = sum(1 for e in NEWS["events"] if e.get("impact") == "High")
+            log.info(f"news: stored {len(NEWS['events'])} events this week "
+                     f"({high} high-impact) from {len(evs)} total")
+            if not NEWS["events"]:
+                log.warning(f"news: zero stored — sample raw keys: "
+                            f"{list(evs[0].keys()) if evs else 'empty'}")
         await asyncio.sleep(1800)
 
 def _event_dt(e):
@@ -1034,15 +1043,19 @@ def _event_dt(e):
     return dt
 
 def news_imminent(window_min=15) -> list:
+    """Returns (title, dt, impact) tuples for events within window_min.
+    Warns for High and Medium — not Low (too noisy)."""
     out = []
     for e in NEWS["events"]:
         try:
-            dt = _event_dt(e)
+            if e.get("impact") not in ("High", "Medium"):
+                continue
+            dt  = _event_dt(e)
             key = e.get("title", "") + dt.isoformat()
             mins = (dt - datetime.now(pytz.utc)).total_seconds() / 60
             if 0 <= mins <= window_min and key not in NEWS["announced"]:
                 NEWS["announced"].add(key)
-                out.append((e.get("title", "High-impact release"), dt))
+                out.append((e.get("title", "Release"), dt, e.get("impact", "Medium")))
         except Exception:
             continue
     if len(NEWS["announced"]) > 300:
@@ -1050,9 +1063,13 @@ def news_imminent(window_min=15) -> list:
     return out
 
 def news_blackout() -> bool:
+    """Only block signals within 15 min of HIGH-impact events.
+    Medium/Low events don't pause the desk."""
     for e in NEWS["events"]:
         try:
-            dt = _event_dt(e)
+            if e.get("impact") != "High":
+                continue
+            dt   = _event_dt(e)
             secs = (dt - datetime.now(pytz.utc)).total_seconds()
             if 0 <= secs <= NEWS_BLACKOUT_MIN * 60:
                 return True
@@ -1061,18 +1078,23 @@ def news_blackout() -> bool:
     return False
 
 def news_today_lines() -> str:
+    """Compact list of ALL today's events — time, impact emoji, title, currency."""
     today = datetime.now(EAT).date()
     items = []
-    for e in NEWS["events"]:
+    for e in sorted(NEWS["events"], key=lambda x: x.get("date", "")):
         try:
             dt = _event_dt(e).astimezone(EAT)
-            if dt.date() == today:
-                items.append(f"  • {dt.strftime('%H:%M')} EAT — {e.get('title', '?')}")
+            if dt.date() != today:
+                continue
+            emoji  = IMPACT_EMOJI.get(e.get("impact", ""), "⚪")
+            ccy    = e.get("country", "")
+            title  = e.get("title", "?")
+            items.append(f"{emoji} {dt.strftime('%H:%M')}  {title}  {ccy}")
         except Exception:
             continue
     if not items:
-        return "No high-impact USD releases scheduled today."
-    return "High-impact USD releases today:\n" + "\n".join(items)
+        return ""
+    return "📅 <b>TODAY'S EVENTS</b>\n" + "\n".join(items)
 
 # ---------------------------------------------------------------- FORMATTING
 def header(title: str) -> str:
@@ -1367,15 +1389,16 @@ async def tick_worker(stores, proxies, h4, ctx):
         try:
             msgs = []                       # plain-text messages
             photos = []                     # (png_bytes, caption)
-            for title, dt in news_imminent(15):
+            for title, dt, impact in news_imminent(15):
                 secs = (dt - datetime.now(pytz.utc)).total_seconds()
                 mins = max(0, int(secs // 60))
                 time_str = f"{mins}min" if mins > 0 else "under a minute"
-                msgs.append(random.choice([
-                    f"📰 <b>{title.upper()} — {time_str} away</b>\nDesk going quiet. No new signals until the number prints.",
-                    f"📰 <b>NEWS: {title.upper()}</b>\nPrinting in {time_str}. Signals paused — respect the vol window.",
-                    f"📰 <b>{title.upper()} IN {time_str}</b>\nExpect a spike. Desk won't fire inside this window.",
-                ]))
+                emoji = IMPACT_EMOJI.get(impact, "📰")
+                pause = impact == "High"
+                msgs.append(
+                    f"{emoji} <b>{title.upper()} — {time_str}</b>\n"
+                    + ("Signals paused until it prints." if pause else "Watch for a move.")
+                )
             for st in stores:
                 msgs += ALERT_ENGINE.scan(st)
                 msgs += MANIP_ENGINE.scan(st)
@@ -1413,6 +1436,21 @@ async def daily_outlook_worker(stores, proxies, h4):
         t = now_eat()
         if t.hour == 7 and t.minute < 2 and sent_for != t.date():
             await tg_send(build_daily_outlook(stores, proxies, h4))
+            sent_for = t.date()
+        await asyncio.sleep(60)
+
+async def news_brief_worker():
+    """Posts all today's economic events at 07:10 EAT — after the daily outlook.
+    Shows every event (High/Medium/Low) so traders know what's dropping all day."""
+    sent_for = None
+    while True:
+        t = now_eat()
+        if t.hour == 7 and 10 <= t.minute < 12 and sent_for != t.date():
+            brief = news_today_lines()
+            if brief:
+                await tg_send(brief + f"\n\n🔴 High = signals pause 15min before\n🟡 Medium = watch for volatility\n⚪ Low = FYI\n\n<i>{BRAND}</i>")
+            else:
+                await tg_send(f"📅 No scheduled events today.\n\n<i>{BRAND}</i>")
             sent_for = t.date()
         await asyncio.sleep(60)
 
@@ -1608,6 +1646,7 @@ async def main_async():
         asyncio.create_task(liquidation_worker()),
         asyncio.create_task(cross_exchange_worker(STORES)),
         asyncio.create_task(news_worker()),
+        asyncio.create_task(news_brief_worker()),
         asyncio.create_task(tick_worker(STORES, PROXIES, H4, CTX)),
         asyncio.create_task(flow_update_worker(STORES)),
         asyncio.create_task(daily_outlook_worker(STORES, PROXIES, H4)),
