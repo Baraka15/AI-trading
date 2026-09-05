@@ -1,43 +1,29 @@
 """
-BRAX FX UNIFIED REAL-TIME DESK  v5.0
-====================================
-One system. Two engines fused.
+BRAX FX — ZONE ENGINE AS MAIN LOGIC  v5.1
+=========================================
+Your FIRST trading robot is the core:
 
-From the original heavy desk:
-  • Full CVD / one-sided flow
-  • Structure (1h + 4h) agreement
-  • Manipulation radar (stop hunt · fake break · absorption · squeeze)
-  • A+ confluence scoring (/12)
-  • Liquidation cascade awareness
-  • News blackout + calendar
-  • Signal tracking to TP1 / TP2 / SL
+  Dynamic Support/Resistance Zones
+  + Multi-factor Reversal Probability
+  + Wide ATR stops for 30min+ holds
+  + High R:R
 
-From the upgraded desk:
-  • Clean human trader voice
-  • Reliable real-time feeds (Binance WS + Twelve Data)
-  • Daily Outlook · Sessions · Flow · SOTD
-  • Lightweight enough for Render
-  • Clear commands
+Everything else is support:
+  • Real-time price feeds (Binance + Twelve Data)
+  • Human desk-style Telegram messages
+  • Daily Outlook · Sessions · Flow · SOTD · News
+  • Signal tracking to outcome
 
-Creative layer:
-  • Dual-engine confirmation (Flow Engine + Structure Engine must agree before A+ fire)
-  • Narrative “desk commentary” on every high-conviction signal
-  • Live regime label (Accumulation / Distribution / Chop / Expansion)
-  • Soft confidence language that still stays disciplined
-
-Assets: BITCOIN (live tape) · GOLD (Twelve Data + PAXG proxy)
-
-ENV
-  TELEGRAM_TOKEN · TELEGRAM_CHAT_ID · TWELVEDATA_API_KEY
+This is the original zone system, upgraded and running live.
 """
 
-import asyncio, os, json, time, logging, random
+import asyncio, os, json, time, math, logging, random
 from collections import deque
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timezone
 from threading import Thread
 
-import numpy as np
-import pandas as pd
 import aiohttp
 import pytz
 from flask import Flask, jsonify
@@ -45,7 +31,7 @@ from flask import Flask, jsonify
 # ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("BRAX")
+log = logging.getLogger("BRAX-ZONE")
 
 TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -59,596 +45,384 @@ EAT = pytz.timezone("Africa/Nairobi")
 BRAND = "BRAX FX"
 FOOT  = "Educational only. Not financial advice."
 
-# Signal discipline
-SIGNAL_MIN   = 10
-SIGNAL_MAX   = 12
-COOLDOWN     = 4 * 3600
-MAX_PER_DAY  = 2
-SL_ATR       = 1.7
-TP1_R        = 1.6
-TP2_R        = 2.9
-NEWS_BLACK   = 15
-ALERT_CD     = 260
-MIN_ONESIDED = 0.27
+# ── MAIN LOGIC CONFIG (your original zone robot) ─────────────
+SYMBOLS = {
+    "XAU/USD": "XAUUSD",
+    "BTC/USD": "BTCUSD",
+}
+
+REV_PROB_THRESHOLD = 0.74          # high probability only
+MIN_TOUCHES        = 3
+MIN_ZONE_CONF      = 0.55
+SL_ATR_MULT        = 3.1           # wide stop (your request)
+TP_ATR_MULT        = 9.2           # high R:R ≈ 1:3
+COOLDOWN_SEC       = 720
+TICK_BUFFER        = 600
+ATR_PERIOD         = 28
+ZONE_EPS_ATR       = 0.38
+ZONE_DECAY         = 0.00028
+ZONE_DEAD_TIME     = 1600
+SWING_K            = 3
+RSI_PERIOD         = 14
+POLL_SEC           = 11
 
 # ─────────────────────────────────────────────────────────────
+@dataclass
+class Zone:
+    center: float
+    width: float
+    touches: int = 0
+    confidence: float = 1.0
+    polarity: str = "NEUTRAL"
+    last_touch: float = field(default_factory=time.time)
+    anchors: List[float] = field(default_factory=list)
+    strength: float = 0.5
+
+# state
+price_buf: Dict[str, deque] = {s: deque(maxlen=TICK_BUFFER) for s in SYMBOLS.values()}
+zones: Dict[str, List[Zone]] = {s: [] for s in SYMBOLS.values()}
+atr_c: Dict[str, float] = {s: 0.0 for s in SYMBOLS.values()}
+rsi_c: Dict[str, float] = {s: 50.0 for s in SYMBOLS.values()}
+last_sig_t: Dict[str, float] = {s: 0.0 for s in SYMBOLS.values()}
+last_sig_h: Dict[str, str] = {s: "" for s in SYMBOLS.values()}
+htf: Dict[str, str] = {s: "NEUTRAL" for s in SYMBOLS.values()}
+last_px: Dict[str, float] = {s: 0.0 for s in SYMBOLS.values()}
+active: Dict[str, dict] = {}
+record = {"tp": 0, "sl": 0}
+sig_count = 0
+
 def now_eat():
     return datetime.now(EAT)
 
 def fp(x, name):
     if not x: return "—"
-    return f"${x:,.0f}" if name in ("BITCOIN", "BTC") else f"${x:,.2f}"
+    return f"${x:,.0f}" if "BTC" in name else f"${x:,.2f}"
 
-DIR_E = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪"}
-DIR_W = {"BULL": "Bullish", "BEAR": "Bearish", "NEUTRAL": "Neutral"}
+# ─────────────────────────────────────────────────────────────
+# CORE: your original zone + reversal probability engine
+# ─────────────────────────────────────────────────────────────
+def compute_atr(prices: List[float], period=ATR_PERIOD) -> float:
+    if len(prices) < period + 1: return 0.0
+    diffs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
+    if len(diffs) < period: return sum(diffs)/len(diffs) if diffs else 0.0
+    return sum(diffs[-period:]) / period
 
-def atr(df, n=14):
-    if df is None or len(df) < n + 1: return 0.0
-    hl = df.h - df.l
-    hc = (df.h - df.c.shift()).abs()
-    lc = (df.l - df.c.shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    v = float(tr.rolling(n).mean().iloc[-1])
-    return 0.0 if np.isnan(v) else v
+def compute_rsi(prices: List[float], period=RSI_PERIOD) -> float:
+    if len(prices) < period + 2: return 50.0
+    deltas = [prices[i]-prices[i-1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period
+    if al <= 0: return 70.0 if ag > 0 else 50.0
+    rs = ag / al
+    return 100 - (100 / (1 + rs))
 
-def day_min():
-    n = datetime.now(EAT).replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(n.timestamp() // 60)
-
-def gold_open():
-    now = datetime.now(pytz.utc)
-    wd, m = now.weekday(), now.hour * 60 + now.minute
-    if wd == 5: return False
-    if wd == 6 and m < 22 * 60: return False
-    if wd == 4 and m >= 22 * 60: return False
-    return True
-
-def session():
-    h = now_eat().hour
-    if 2 <= h < 8: return "ASIA"
-    if 8 <= h < 13: return "LONDON"
-    if 13 <= h < 17: return "NEW YORK"
-    if 17 <= h < 21: return "NY PM"
+def detect_swing(buf: deque, k=SWING_K) -> Optional[Tuple[str, float]]:
+    if len(buf) < 2*k + 1: return None
+    prices = list(buf)
+    mid_idx = -k - 1
+    mid = prices[mid_idx]
+    left = prices[-2*k-1:mid_idx]
+    right = prices[-k:]
+    if mid > max(left) and mid > max(right): return ("HIGH", mid)
+    if mid < min(left) and mid < min(right): return ("LOW", mid)
     return None
 
-# ─────────────────────────────────────────────────────────────
-class Store:
-    def __init__(self, name, ws=None):
-        self.name, self.ws = name, ws
-        self._c = {}
-        self._df = None
-        self._ts = 0.0
-        self.price = 0.0
-        self.cvd = deque(maxlen=100000)
-        self.last = 0.0
-        self.source = "—"
+def update_zones(sym: str, anchor: float, atr: float, swing_type: Optional[str]):
+    attached = False
+    for z in zones[sym]:
+        if abs(anchor - z.center) < ZONE_EPS_ATR * atr:
+            z.anchors.append(anchor)
+            if len(z.anchors) > 12: z.anchors = z.anchors[-12:]
+            z.center = sum(z.anchors) / len(z.anchors)
+            std = (sum((a - z.center)**2 for a in z.anchors) / len(z.anchors))**0.5
+            z.width = std + 0.15 * atr
+            z.touches += 1
+            z.confidence = min(1.0, z.confidence + 0.12)
+            z.strength = z.confidence * min(1.0, z.touches / 6.0)
+            if swing_type == "HIGH": z.polarity = "RESISTANCE"
+            elif swing_type == "LOW": z.polarity = "SUPPORT"
+            attached = True
+            break
+    if not attached:
+        pol = "RESISTANCE" if swing_type == "HIGH" else "SUPPORT" if swing_type == "LOW" else "NEUTRAL"
+        zones[sym].append(Zone(center=anchor, width=0.28*atr, anchors=[anchor], polarity=pol, strength=0.4))
 
-    def _bar(self, m, o, h, l, c, v):
-        if m in self._c:
-            b = self._c[m]
-            self._c[m] = [b[0], max(b[1], h), min(b[2], l), c, v]
+def merge_zones(sym: str, atr: float):
+    if len(zones[sym]) < 2: return
+    zones[sym].sort(key=lambda z: z.center)
+    i = 0
+    while i < len(zones[sym]) - 1:
+        z1, z2 = zones[sym][i], zones[sym][i+1]
+        if abs(z1.center - z2.center) < (z1.width + z2.width) * 0.55:
+            anchors = z1.anchors + z2.anchors
+            center = sum(anchors)/len(anchors)
+            std = (sum((a-center)**2 for a in anchors)/len(anchors))**0.5
+            width = std + 0.15*atr
+            touches = z1.touches + z2.touches
+            conf = (z1.confidence + z2.confidence)/2
+            pol = z1.polarity if z1.polarity == z2.polarity else "NEUTRAL"
+            strength = conf * min(1.0, touches/6.0)
+            zones[sym][i] = Zone(center, width, touches, conf, pol,
+                                 max(z1.last_touch, z2.last_touch), anchors, strength)
+            del zones[sym][i+1]
         else:
-            self._c[m] = [o, h, l, c, v]
-        self.price = c
-        self.last = time.time()
-        self._df = None
+            i += 1
 
-    def kline(self, k):
-        m = int(k["t"]) // 60000
-        self._bar(m, float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]))
+def process_zones(sym: str, price: float, atr: float):
+    now = time.time()
+    for z in zones[sym]:
+        age = now - z.last_touch
+        z.confidence *= math.exp(-ZONE_DECAY * age)
+        z.strength = z.confidence * min(1.0, z.touches / 6.0)
+        if abs(price - z.center) < z.width and age > 10:
+            z.touches += 1
+            z.last_touch = now
+            z.confidence = min(1.0, z.confidence + 0.14)
+            z.strength = z.confidence * min(1.0, z.touches / 6.0)
 
-    def trade(self, t):
-        p, q = float(t["p"]), float(t["q"])
-        sell = bool(t.get("m", t.get("isBuyerMaker", False)))
-        ts = t.get("T") or int(time.time() * 1000)
-        self.cvd.append((ts / 1000 if ts > 1e11 else ts, -q if sell else q, p))
-        self.last = time.time()
+def prune_zones(sym: str):
+    now = time.time()
+    zones[sym] = [z for z in zones[sym] if z.confidence > 0.22 and (now - z.last_touch) < ZONE_DEAD_TIME]
 
-    def df(self, rule="1min", limit=200):
-        if not self._c:
-            return pd.DataFrame(columns=list("ohlcv"))
-        now = time.time()
-        if self._df is None or now - self._ts > 18:
-            d = pd.DataFrame.from_dict(self._c, orient="index", columns=list("ohlcv"))
-            d.index = pd.to_datetime(d.index * 60, unit="s")
-            self._df, self._ts = d.sort_index(), now
-        d = self._df
-        if rule != "1min":
-            d = d.resample(rule).agg({"o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"}).dropna()
-        return d.tail(limit)
+def compute_reversal_prob(sym: str, price: float, atr: float) -> List[dict]:
+    """MAIN LOGIC — your original multi-factor reversal probability"""
+    results = []
+    prices = list(price_buf[sym])
+    if len(prices) < 35 or atr <= 0: return results
 
-    def vwap(self):
-        rows = [v for k, v in self._c.items() if k >= day_min() and v[4] > 0]
-        if not rows: return None
-        pv = sum(r[3] * r[4] for r in rows)
-        vv = sum(r[4] for r in rows)
-        return pv / vv if vv else None
+    velocity = [prices[i]-prices[i-1] for i in range(-6, 0)]
+    v_mean = sum(velocity)/len(velocity)
+    v_norm = abs(v_mean)/(atr + 1e-9)
+    exhaustion = max(0.0, 1.0 - min(v_norm, 1.5)/1.5)
 
-    def age(self):
-        return time.time() - self.last
+    short_std = (sum((p - sum(prices[-15:])/15)**2 for p in prices[-15:])/15)**0.5
+    long_std  = (sum((p - sum(prices[-50:])/50)**2 for p in prices[-50:])/50)**0.5 + 1e-9
+    compression = max(0.0, 1.0 - short_std/long_std)
 
-# ─────────────────────────────────────────────────────────────
-def cvd_win(st, sec, signed=True):
-    cut = time.time() - sec
-    tot = 0.0
-    for t, s, p in reversed(st.cvd):
-        if t < cut: break
-        tot += s if signed else abs(s)
-    return tot
+    rsi = rsi_c[sym]
+    trend = htf[sym]
 
-def flow(st):
-    if not st.cvd or st.age() > 160: return None
-    c15, c1h = cvd_win(st, 900), cvd_win(st, 3600)
-    v15, v1h = cvd_win(st, 900, False), cvd_win(st, 3600, False)
-    o15 = abs(c15) / v15 if v15 else 0
-    o1h = abs(c1h) / v1h if v1h else 0
-    if c1h > 0 and o1h >= MIN_ONESIDED: d = "BULL"
-    elif c1h < 0 and o1h >= MIN_ONESIDED: d = "BEAR"
-    elif c15 > 0: d = "BULL"
-    elif c15 < 0: d = "BEAR"
-    else: d = "NEUTRAL"
-    conv = "High" if o1h >= 0.42 else ("Medium" if o1h >= MIN_ONESIDED else "Low")
-    if d == "BULL":
-        reg = "ACCUMULATION" if c15 > 0 else "PULLBACK-BUYING"
-    elif d == "BEAR":
-        reg = "DISTRIBUTION" if c15 < 0 else "RALLY-SELLING"
-    else:
-        reg = "CHOP"
-    return dict(dir=d, c15=c15, c1h=c1h, ones15=o15, ones1h=o1h, conv=conv, regime=reg)
+    for z in zones[sym]:
+        if z.touches < MIN_TOUCHES or z.confidence < MIN_ZONE_CONF: continue
+        dist = abs(price - z.center)
+        if dist > z.width * 1.1: continue
 
-def structure(st, h4):
-    intra = wk = "NEUTRAL"
-    d = st.df("1h", 48)
-    if len(d) >= 18:
-        last = float(d.c.iloc[-1])
-        sh, sl = float(d.h.iloc[:-1].max()), float(d.l.iloc[:-1].min())
-        if last > sh: intra = "BULL"
-        elif last < sl: intra = "BEAR"
+        impulse = math.exp(-dist / (atr * 0.95))
+        approach = 0.0
+        rsi_b = 0.0
+
+        if z.polarity == "RESISTANCE":
+            approach = 0.14 * v_norm if v_mean > 0 else -0.05
+            rsi_b = 0.11 if rsi > 65 else (-0.07 if rsi < 38 else 0)
+        elif z.polarity == "SUPPORT":
+            approach = 0.14 * v_norm if v_mean < 0 else -0.05
+            rsi_b = 0.11 if rsi < 35 else (-0.07 if rsi > 62 else 0)
         else:
-            ma = float(d.c.rolling(18).mean().iloc[-1])
-            intra = "BULL" if last > ma else "BEAR" if last < ma else "NEUTRAL"
-    closes = h4.get(st.name)
-    if closes is not None and len(closes) >= 45:
-        last = float(closes.iloc[-1])
-        m20, m50 = float(closes.tail(20).mean()), float(closes.tail(45).mean())
-        if m20 > m50 and last > m20: wk = "BULL"
-        elif m20 < m50 and last < m20: wk = "BEAR"
-    return intra, wk
+            continue
+
+        htf_s = 0.0
+        if z.polarity == "SUPPORT" and trend == "BULL": htf_s = 0.11
+        elif z.polarity == "RESISTANCE" and trend == "BEAR": htf_s = 0.11
+        elif z.polarity == "SUPPORT" and trend == "BEAR": htf_s = -0.15
+        elif z.polarity == "RESISTANCE" and trend == "BULL": htf_s = -0.15
+
+        raw = (0.28 * z.strength + 0.15 * exhaustion + 0.11 * compression +
+               0.14 * impulse + approach + rsi_b + htf_s)
+        prob = max(0.0, min(1.0, raw))
+        results.append({"zone": z, "probability": prob})
+    return results
+
+def update_htf(sym: str):
+    prices = list(price_buf[sym])
+    if len(prices) < 55: return
+    ema_f = sum(prices[-20:])/20
+    ema_s = sum(prices[-50:])/50
+    if ema_f > ema_s * 1.0005: htf[sym] = "BULL"
+    elif ema_f < ema_s * 0.9995: htf[sym] = "BEAR"
+    else: htf[sym] = "NEUTRAL"
 
 # ─────────────────────────────────────────────────────────────
-class SignalEngine:
-    def __init__(self):
-        self.active = {}
-        self.counts = {}
-        self.last = {}
-        self.rec = {"tp2": 0, "tp1": 0, "sl": 0}
-
-    def ok(self, n):
-        if time.time() - self.last.get(n, 0) < COOLDOWN: return False
-        return self.counts.get(now_eat().strftime("%Y-%m-%d"), 0) < MAX_PER_DAY
-
-    def score(self, st, h4, proxies):
-        fs = st if st.cvd else proxies.get(st.name, st)
-        fm = flow(fs)
-        if not fm or fm["dir"] == "NEUTRAL": return None, 0, {}
-        intra, wk = structure(st, h4)
-        p = {}
-        if intra == fm["dir"]: p["1h structure aligned"] = 2
-        elif intra != "NEUTRAL": p["1h structure partial"] = 1
-        if wk == fm["dir"]: p["4h trend agrees"] = 1
-        if fm["conv"] == "High": p["strong one-sided tape"] = 2
-        elif fm["conv"] == "Medium": p["decent tape"] = 1
-        if fm["regime"] in ("ACCUMULATION", "DISTRIBUTION"): p["regime confirms"] = 2
-        vw = st.vwap()
-        if vw and st.price:
-            if (st.price > vw and fm["dir"] == "BULL") or (st.price < vw and fm["dir"] == "BEAR"):
-                p["right side of VWAP"] = 1
-        d5 = st.df("5min", 18)
-        if len(d5) >= 12 and st.price:
-            a5 = atr(d5, 10)
-            if a5 and a5 / st.price > 0.00035: p["volatility supports"] = 1
-        return fm["dir"], sum(p.values()), p
-
-    def fire(self, st, h4, proxies):
-        n = st.name
-        if n not in ("BITCOIN", "GOLD"): return None
-        if n in self.active or not self.ok(n): return None
-        if n == "GOLD" and not gold_open(): return None
-        if news_black(): return None
-        d, sc, parts = self.score(st, h4, proxies)
-        if d is None or sc < SIGNAL_MIN: return None
-        a = atr(st.df("15min", 45), 14)
-        if not a or not st.price: return None
-        entry = st.price
-        risk = SL_ATR * a
-        if d == "BULL":
-            sl, tp1, tp2 = entry - risk, entry + TP1_R * risk, entry + TP2_R * risk
-            arrow = "LONG"
-        else:
-            sl, tp1, tp2 = entry + risk, entry - TP1_R * risk, entry - TP2_R * risk
-            arrow = "SHORT"
-        self.active[n] = dict(dir=d, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                              score=sc, t=time.time(), tp1_hit=False, parts=parts)
-        k = now_eat().strftime("%Y-%m-%d")
-        self.counts[k] = self.counts.get(k, 0) + 1
-        self.last[n] = time.time()
-        why = " · ".join(parts)
-        conf = "high conviction" if sc >= 11 else "clean setup"
-        # Creative human desk voice
-        openers = [
-            "I’m taking this.",
-            "This one looks clean enough.",
-            "Putting this on the board.",
-            "Flow and structure finally agree.",
-        ]
-        return (
-            f"{'🟢' if d == 'BULL' else '🔴'} <b>{n} — {arrow}</b>\n\n"
-            f"{random.choice(openers)}\n\n"
-            f"Entry   {fp(entry, n)}\n"
-            f"Stop    {fp(sl, n)}\n"
-            f"TP1     {fp(tp1, n)}\n"
-            f"TP2     {fp(tp2, n)}\n\n"
-            f"Score {sc}/{SIGNAL_MAX} · {conf}\n"
-            f"{why}\n\n"
-            f"<i>Tracking live. Hold for the move.</i>\n"
-            f"{now_eat().strftime('%H:%M EAT')}"
-        )
-
-    def track(self, st):
-        s = self.active.get(st.name)
-        if not s or not st.price: return []
-        n = st.name
-        if s["dir"] == "BULL":
-            hit_sl, hit1, hit2 = st.price <= s["sl"], st.price >= s["tp1"], st.price >= s["tp2"]
-        else:
-            hit_sl, hit1, hit2 = st.price >= s["sl"], st.price <= s["tp1"], st.price <= s["tp2"]
-        if hit_sl:
-            del self.active[n]; self.rec["sl"] += 1
-            return [f"❌ <b>{n} stopped</b> @ {fp(s['sl'], n)}\nInvalidated. Next clean window only."]
-        if hit1 and not s["tp1_hit"]:
-            s["tp1_hit"] = True; self.rec["tp1"] += 1
-            return [f"✅ <b>{n} TP1 hit</b> {fp(s['tp1'], n)}\nTrailing the rest to TP2 {fp(s['tp2'], n)}."]
-        if s["tp1_hit"] and hit2:
-            del self.active[n]; self.rec["tp2"] += 1
-            return [f"🏆 <b>{n} full target</b> — TP2 {fp(s['tp2'], n)}\nDone. Resetting."]
-        return []
-
-    def line(self):
-        r = self.rec
-        tot = r["tp2"] + r["tp1"] + r["sl"]
-        if not tot: return "No closed signals yet."
-        return f"Record: {r['tp2']+r['tp1']}/{tot} green (TP2 {r['tp2']} · TP1 {r['tp1']} · SL {r['sl']})"
-
-SIG = SignalEngine()
-
+# TELEGRAM (human desk voice)
 # ─────────────────────────────────────────────────────────────
-class Manip:
-    def __init__(self):
-        self.st = {}
-
-    def cool(self, n, k, sec):
-        S = self.st.setdefault(n, {})
-        if time.time() - S.get(k, 0) < sec: return False
-        S[k] = time.time(); return True
-
-    def scan(self, st):
-        out = []
-        if st.name != "BITCOIN" or not st.cvd: return out
-        d5 = st.df("5min", 40)
-        if len(d5) < 18: return out
-        fm = flow(st)
-        prior, lc = d5.iloc[:-2], d5.iloc[-2]
-        sh, sl = float(prior.h.max()), float(prior.l.min())
-        # stop hunt
-        if lc.h > sh and lc.c < sh and self.cool(st.name, "hunt_h", 1600):
-            out.append(f"🪤 <b>Stop hunt</b> on {st.name}\nWick above {fp(sh, st.name)}, closed back under. Not a real break.")
-        elif lc.l < sl and lc.c > sl and self.cool(st.name, "hunt_l", 1600):
-            out.append(f"🪤 <b>Stop hunt</b> on {st.name}\nWick below {fp(sl, st.name)}, snapped back. Don’t sell the low.")
-        # fake break
-        if fm:
-            if lc.c > sh and float(d5.c.iloc[-1]) < sh and self.cool(st.name, "fake_h", 1600):
-                out.append(f"🎭 <b>Fake breakout</b> {st.name}\nBroke {fp(sh, st.name)} then failed. Trap.")
-            elif lc.c < sl and float(d5.c.iloc[-1]) > sl and self.cool(st.name, "fake_l", 1600):
-                out.append(f"🎭 <b>Fake breakdown</b> {st.name}\nBroke {fp(sl, st.name)} then reclaimed. Trap.")
-        return out
-
-MANIP = Manip()
-
-class Alert:
-    def __init__(self):
-        self.st = {}
-
-    def cool(self, n, k, sec):
-        S = self.st.setdefault(n, {})
-        if time.time() - S.get(k, 0) < sec: return False
-        S[k] = time.time(); return True
-
-    def scan(self, st):
-        out = []
-        if st.name != "BITCOIN": return out
-        fm = flow(st)
-        if not fm: return out
-        S = self.st.setdefault(st.name, {})
-        if "dir" in S and S["dir"] != fm["dir"] and fm["dir"] != "NEUTRAL" \
-                and fm["ones1h"] >= MIN_ONESIDED and self.cool(st.name, "flip", ALERT_CD):
-            out.append(
-                f"🔁 <b>Tape flipped {DIR_W[fm['dir']].lower()}</b> on {st.name}\n"
-                f"{fm['ones1h']*100:.0f}% one-sided · {fm['conv'].lower()} @ {fp(st.price, st.name)}"
-            )
-        S["dir"] = fm["dir"]
-        return out
-
-ALERT = Alert()
-
-# ─────────────────────────────────────────────────────────────
-NEWS = {"ev": [], "ann": set()}
-
-async def news_worker(session):
-    while True:
-        try:
-            async with session.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-                                   timeout=aiohttp.ClientTimeout(total=12)) as r:
-                if r.status == 200:
-                    evs = await r.json()
-                    NEWS["ev"] = [e for e in evs if e.get("country") in ("USD", "EUR", "GBP") or e.get("impact") == "High"]
-                    log.info(f"News: {len(NEWS['ev'])} events")
-        except Exception as e:
-            log.warning(f"News: {e}")
-        await asyncio.sleep(1800)
-
-def news_black():
-    for e in NEWS["ev"]:
-        try:
-            if e.get("impact") != "High": continue
-            dt = datetime.fromisoformat(e["date"])
-            if dt.tzinfo is None: dt = dt.replace(tzinfo=pytz.utc)
-            if 0 <= (dt - datetime.now(pytz.utc)).total_seconds() <= NEWS_BLACK * 60:
-                return True
-        except: pass
-    return False
-
-def news_today():
-    today = now_eat().date()
-    items = []
-    for e in sorted(NEWS["ev"], key=lambda x: x.get("date", "")):
-        try:
-            dt = datetime.fromisoformat(e["date"])
-            if dt.tzinfo is None: dt = dt.replace(tzinfo=pytz.utc)
-            local = dt.astimezone(EAT)
-            if local.date() != today: continue
-            em = "🔴" if e.get("impact") == "High" else "🟡" if e.get("impact") == "Medium" else "⚪"
-            items.append(f"{em} {local.strftime('%H:%M')}  {e.get('title','?')}  {e.get('country','')}")
-        except: pass
-    return ("📅 <b>Today’s events</b>\n" + "\n".join(items)) if items else ""
-
-# ─────────────────────────────────────────────────────────────
-async def tg(session, text):
+async def tg(session, text: str):
     try:
-        async with session.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        async with session.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": True},
-            timeout=aiohttp.ClientTimeout(total=10)) as r:
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
             if r.status != 200: log.warning(f"TG {r.status}")
     except Exception as e:
         log.error(f"TG: {e}")
 
+def human_signal(sym, bias, price, sl, tp, prob, atr, zone, rsi, trend):
+    rr = abs(tp - price) / max(abs(price - sl), 1e-9)
+    openers = [
+        "I’m taking this one.",
+        "Zone is holding. Going with it.",
+        "Clean reaction here.",
+        "This looks solid enough.",
+    ]
+    conf = "high conviction" if prob >= 0.80 else "solid setup"
+    why = "price reacting from support" if bias == "BUY" else "price rejecting resistance"
+    return (
+        f"{'🟢' if bias == 'BUY' else '🔴'} <b>{sym} — {bias}</b>\n\n"
+        f"{random.choice(openers)}\n\n"
+        f"Entry   {fp(price, sym)}\n"
+        f"Stop    {fp(sl, sym)}\n"
+        f"Target  {fp(tp, sym)}\n\n"
+        f"R:R ≈ 1:{rr:.1f}  ·  Prob {prob*100:.0f}% ({conf})\n"
+        f"Why: {why}\n"
+        f"Zone touches: {zone.touches} · RSI {rsi:.0f} · HTF {trend}\n"
+        f"ATR {atr:.2f}\n\n"
+        f"<i>Hold for the move — 30 min+ preferred.</i>\n"
+        f"{now_eat().strftime('%H:%M EAT')}"
+    )
+
 # ─────────────────────────────────────────────────────────────
-async def seed_btc(session, st):
+# DATA
+# ─────────────────────────────────────────────────────────────
+async def fetch_price(session, td_sym: str) -> Optional[float]:
     try:
-        async with session.get("https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=120") as r:
-            data = await r.json()
-        for k in data:
-            st._bar(int(k[0]) // 60000, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
-        st.source = "Binance"
-        log.info(f"BTC seeded @ {st.price}")
-    except Exception as e: log.error(f"BTC seed: {e}")
+        url = f"https://api.twelvedata.com/price?symbol={td_sym}&apikey={TD_KEY}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            d = await r.json()
+        if "price" in d: return float(d["price"])
+    except Exception as e:
+        log.debug(f"price {td_sym}: {e}")
+    return None
 
-async def seed_gold(session, st):
-    try:
-        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1min&outputsize=80&apikey={TD_KEY}"
-        async with session.get(url) as r:
-            data = await r.json()
-        for row in reversed(data.get("values") or []):
-            dt = datetime.fromisoformat(row["datetime"].replace("Z", ""))
-            st._bar(int(dt.timestamp() // 60), float(row["open"]), float(row["high"]),
-                    float(row["low"]), float(row["close"]), 0)
-        st.source = "TwelveData"
-        log.info(f"GOLD seeded @ {st.price}")
-    except Exception as e: log.error(f"Gold seed: {e}")
-
-async def ws_loop(stores):
-    url = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@kline_1m/paxgusdt@trade/paxgusdt@kline_1m"
-    while True:
+async def seed(session):
+    log.info("Seeding from Twelve Data...")
+    for td, sym in SYMBOLS.items():
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.ws_connect(url, heartbeat=25) as ws:
-                    log.info("Binance WS live")
-                    async for msg in ws:
-                        if msg.type != aiohttp.WSMsgType.TEXT: continue
-                        p = json.loads(msg.data)
-                        data, stream = p.get("data") or {}, p.get("stream", "")
-                        if "trade" in stream:
-                            name = "BITCOIN" if "btcusdt" in stream else "PAXG"
-                            st = next((x for x in stores if x.name == name), None)
-                            if st: st.trade(data)
-                        elif "kline" in stream:
-                            k = data.get("k") or {}
-                            if not k.get("x"): continue
-                            name = "BITCOIN" if "btcusdt" in stream else "PAXG"
-                            st = next((x for x in stores if x.name == name), None)
-                            if st:
-                                st.kline(k)
-                                st.source = "Binance WS"
+            url = f"https://api.twelvedata.com/time_series?symbol={td}&interval=1min&outputsize=80&apikey={TD_KEY}"
+            async with session.get(url) as r:
+                d = await r.json()
+            vals = d.get("values") or []
+            for row in reversed(vals):
+                price_buf[sym].append(float(row["close"]))
+            if vals:
+                last_px[sym] = float(vals[0]["close"])
+                log.info(f"  {sym}: {len(vals)} bars | last={last_px[sym]:.2f}")
         except Exception as e:
-            log.warning(f"WS: {e}"); await asyncio.sleep(4)
+            log.warning(f"  {sym} seed fail: {e}")
+        await asyncio.sleep(1.2)
 
-async def gold_loop(session, st):
+# ─────────────────────────────────────────────────────────────
+# MAIN SIGNAL LOOP (zone engine drives everything)
+# ─────────────────────────────────────────────────────────────
+async def signal_loop(session):
+    global sig_count
+    log.info("Zone engine live")
     while True:
         try:
-            if gold_open():
-                async with session.get(f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TD_KEY}") as r:
-                    d = await r.json()
-                if "price" in d:
-                    p = float(d["price"])
-                    st._bar(int(time.time() // 60), p, p, p, p, 0)
-                    st.source = "TwelveData"
-        except Exception as e: log.debug(f"Gold: {e}")
-        await asyncio.sleep(40 if gold_open() else 300)
+            for td_sym, sym in SYMBOLS.items():
+                price = await fetch_price(session, td_sym)
+                if price is None or price <= 0: continue
 
-async def h4_loop(session, h4, stores):
-    while True:
-        try:
-            for st in stores:
-                if st.name == "BITCOIN":
-                    async with session.get("https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=70") as r:
-                        data = await r.json()
-                    h4["BITCOIN"] = pd.Series([float(k[4]) for k in data])
-                elif st.name == "GOLD":
-                    async with session.get(f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=4h&outputsize=50&apikey={TD_KEY}") as r:
-                        data = await r.json()
-                    vals = data.get("values") or []
-                    if vals: h4["GOLD"] = pd.Series([float(v["close"]) for v in reversed(vals)])
-        except Exception as e: log.warning(f"H4: {e}")
-        await asyncio.sleep(280)
+                price_buf[sym].append(price)
+                last_px[sym] = price
+                prices = list(price_buf[sym])
+                atr = compute_atr(prices)
+                atr_c[sym] = atr
+                rsi_c[sym] = compute_rsi(prices)
+                if atr <= 0 or len(prices) < 40: continue
 
+                update_htf(sym)
+
+                swing = detect_swing(price_buf[sym])
+                if swing:
+                    update_zones(sym, swing[1], atr, swing[0])
+                    merge_zones(sym, atr)
+                process_zones(sym, price, atr)
+                prune_zones(sym)
+
+                # ── MAIN LOGIC FIRE ──
+                revs = compute_reversal_prob(sym, price, atr)
+                now = time.time()
+                for r in revs:
+                    if r["probability"] < REV_PROB_THRESHOLD: continue
+                    z = r["zone"]
+                    bias = "SELL" if z.polarity == "RESISTANCE" else "BUY" if z.polarity == "SUPPORT" else None
+                    if not bias: continue
+                    if now - last_sig_t.get(sym, 0) < COOLDOWN_SEC: continue
+                    h = f"{sym}-{bias}-{round(z.center,1)}"
+                    if last_sig_h.get(sym) == h: continue
+
+                    last_sig_t[sym] = now
+                    last_sig_h[sym] = h
+                    sig_count += 1
+
+                    if bias == "BUY":
+                        sl = price - SL_ATR_MULT * atr
+                        tp = price + TP_ATR_MULT * atr
+                    else:
+                        sl = price + SL_ATR_MULT * atr
+                        tp = price - TP_ATR_MULT * atr
+
+                    msg = human_signal(sym, bias, price, sl, tp, r["probability"],
+                                       atr, z, rsi_c[sym], htf[sym])
+                    await tg(session, msg)
+                    log.info(f"SIGNAL #{sig_count} {bias} {sym} @ {price:.2f} prob={r['probability']:.2f}")
+
+                    # track
+                    active[sym] = {"bias": bias, "entry": price, "sl": sl, "tp": tp, "t": now}
+
+                # track open
+                if sym in active:
+                    a = active[sym]
+                    if a["bias"] == "BUY":
+                        if price <= a["sl"]:
+                            await tg(session, f"❌ <b>{sym} stopped</b> @ {fp(a['sl'], sym)}")
+                            record["sl"] += 1; del active[sym]
+                        elif price >= a["tp"]:
+                            await tg(session, f"🏆 <b>{sym} target hit</b> @ {fp(a['tp'], sym)}")
+                            record["tp"] += 1; del active[sym]
+                    else:
+                        if price >= a["sl"]:
+                            await tg(session, f"❌ <b>{sym} stopped</b> @ {fp(a['sl'], sym)}")
+                            record["sl"] += 1; del active[sym]
+                        elif price <= a["tp"]:
+                            await tg(session, f"🏆 <b>{sym} target hit</b> @ {fp(a['tp'], sym)}")
+                            record["tp"] += 1; del active[sym]
+
+            await asyncio.sleep(POLL_SEC)
+        except Exception as e:
+            log.error(f"loop: {e}", exc_info=True)
+            await asyncio.sleep(15)
+
+# ─────────────────────────────────────────────────────────────
+# DESK FEATURES (support the main zone logic)
 # ─────────────────────────────────────────────────────────────
 def build_now():
     lines = [f"<b>Live desk</b>  ·  {now_eat().strftime('%H:%M EAT')}\n"]
-    for st in STORES:
-        fs = st if st.cvd else PROXIES.get(st.name, st)
-        fm = flow(fs)
-        d = fm["dir"] if fm else "NEUTRAL"
-        lines.append(f"{DIR_E[d]} <b>{st.name}</b>  {fp(st.price, st.name)}  ·  {DIR_W[d]} · {fm['conv'] if fm else '—'}")
-    if SIG.active:
+    for sym in SYMBOLS.values():
+        lines.append(f"• <b>{sym}</b>  {fp(last_px.get(sym), sym)}  ·  HTF {htf.get(sym,'—')}  ·  zones {len(zones.get(sym,[]))}")
+    if active:
         lines.append("")
-        for n, s in SIG.active.items():
-            lines.append(f"Open: {n} {'LONG' if s['dir']=='BULL' else 'SHORT'} · SL {fp(s['sl'], n)} · TP1 {fp(s['tp1'], n)}")
-    lines.append(f"\n{SIG.line()}")
-    return "\n".join(lines)
-
-def build_flow():
-    lines = [f"<b>Flow</b>  ·  {now_eat().strftime('%H:%M EAT')}\n"]
-    for st in STORES:
-        fs = st if st.cvd else PROXIES.get(st.name, st)
-        fm = flow(fs)
-        if fm and fm["dir"] != "NEUTRAL":
-            lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}\n{DIR_W[fm['dir']]} · {fm['conv']} · CVD 15m {fm['c15']:+,.0f}")
-        else:
-            lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}  ·  quiet")
-    return "\n\n".join(lines)
-
-def build_signals():
-    lines = [f"<b>Signals</b>  ·  {now_eat().strftime('%H:%M EAT')}\n"]
-    if SIG.active:
-        for n, s in SIG.active.items():
-            age = int((time.time() - s["t"]) / 60)
-            lines.append(f"<b>{n} {'LONG' if s['dir']=='BULL' else 'SHORT'}</b>  {s['score']}/{SIGNAL_MAX}  ·  {age}m\nEntry {fp(s['entry'], n)} · SL {fp(s['sl'], n)}\nTP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
-    else:
-        lines.append("No open signals.")
-    lines.append(f"\n{SIG.line()}")
+        for s, a in active.items():
+            lines.append(f"Open: {s} {a['bias']} · SL {fp(a['sl'], s)} · TP {fp(a['tp'], s)}")
+    tot = record["tp"] + record["sl"]
+    lines.append(f"\nRecord: {record['tp']}/{tot} green" if tot else "\nNo closed signals yet")
     return "\n".join(lines)
 
 def build_outlook():
-    lines = [f"🌅 <b>Daily outlook</b>  ·  {now_eat().strftime('%a %d %b').upper()}\n"]
-    for st in STORES:
-        if st.name == "GOLD" and not gold_open(): continue
-        fs = st if st.cvd else PROXIES.get(st.name, st)
-        fm = flow(fs)
-        intra, wk = structure(st, H4)
-        d = fm["dir"] if fm else "NEUTRAL"
-        lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}\n1h {DIR_W[intra]} · 4h {DIR_W[wk]} · Tape {DIR_W[d]}")
-    n = news_today()
-    if n: lines.append(f"\n{n}")
-    lines.append(f"\n{SIG.line()}\n\n<i>{FOOT}</i>")
-    return "\n".join(lines)
-
-def build_sotd():
-    scored = []
-    for st in STORES:
-        if st.name == "GOLD" and not gold_open(): continue
-        fs = st if st.cvd else PROXIES.get(st.name, st)
-        fm = flow(fs)
-        if not fm or fm["dir"] == "NEUTRAL":
-            scored.append((st, 0, "NEUTRAL", ["no clear tape"]))
-            continue
-        intra, wk = structure(st, H4)
-        sc, reasons = 0, []
-        if intra == fm["dir"]: sc += 3; reasons.append(f"1h matches {DIR_W[fm['dir']].lower()} tape")
-        if wk == fm["dir"]: sc += 2; reasons.append("4h agrees")
-        if fm["conv"] == "High": sc += 2; reasons.append("strong pressure")
-        if fm["regime"] in ("ACCUMULATION", "DISTRIBUTION"): sc += 1; reasons.append(fm["regime"].lower())
-        scored.append((st, min(sc, 10), fm["dir"], reasons))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    lines = [f"📡 <b>Signal of the day</b>  ·  {now_eat().strftime('%H:%M EAT')}\n"]
-    for st, sc, d, reasons in scored:
-        if sc < 5 or d == "NEUTRAL":
-            lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)} · no clean bias")
-        else:
-            lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)} · <b>{'LONG' if d=='BULL' else 'SHORT'} · {sc}/10</b>\n{(reasons[0] if reasons else '').capitalize()}.")
-    lines.append(f"\n{SIG.line()}\n\n<i>This is the lean. Actual levels fire only on A+ confluence.</i>")
-    return "\n\n".join(lines)
-
-def build_health():
-    lines = [f"<b>Status</b>  ·  {now_eat().strftime('%H:%M EAT')}\n"]
-    for st in STORES:
-        age = st.age()
-        lines.append(f"{'🟢' if age < 90 else '🔴'} {st.name}  {fp(st.price, st.name)}  ·  {st.source}  ·  {age:.0f}s")
-    lines.append(f"Session: {session() or 'CLOSED'} · News: {'BLACKOUT' if news_black() else 'clear'}")
-    lines.append(SIG.line())
+    lines = [f"🌅 <b>Daily outlook</b>  ·  {now_eat().strftime('%a %d %b')}\n"]
+    for sym in SYMBOLS.values():
+        lines.append(f"<b>{sym}</b>  {fp(last_px.get(sym), sym)}  ·  HTF {htf.get(sym,'—')}")
+    lines.append(f"\nZone engine watching. A+ reversals only.\n\n<i>{FOOT}</i>")
     return "\n".join(lines)
 
 HELP = (
-    f"<b>{BRAND} Unified Desk</b>\n\n"
-    "/now /flow /signal /dayoutlook /sotd /health /help\n\n"
-    "A+ only (≥10/12) · max 2/day · 4h cooldown\n"
-    f"{FOOT}"
+    f"<b>{BRAND} — Zone Engine</b>\n\n"
+    "Main logic: Dynamic zones + reversal probability\n\n"
+    "/now — live\n/outlook — daily bias\n/health — status\n/help\n\n"
+    f"Prob ≥ {int(REV_PROB_THRESHOLD*100)}% · Wide SL · High R:R\n{FOOT}"
 )
-
-# ─────────────────────────────────────────────────────────────
-async def tick(session, stores, proxies, h4):
-    while True:
-        try:
-            msgs = []
-            for st in stores:
-                msgs += ALERT.scan(st)
-                msgs += MANIP.scan(st)
-                msgs += SIG.track(st)
-                if st.name in ("BITCOIN", "GOLD"):
-                    sig = SIG.fire(st, h4, proxies)
-                    if sig: msgs.append(sig)
-            for m in msgs: await tg(session, m)
-        except Exception: log.exception("tick")
-        await asyncio.sleep(7)
-
-async def schedule(session):
-    sent_d = sent_s = sent_n = None
-    opened = set()
-    while True:
-        t = now_eat()
-        if t.hour == 7 and t.minute < 2 and sent_d != t.date():
-            await tg(session, build_outlook()); sent_d = t.date()
-        if t.hour == 7 and 5 <= t.minute < 7 and sent_s != t.date():
-            await tg(session, build_sotd()); sent_s = t.date()
-        if t.hour == 7 and 10 <= t.minute < 12 and sent_n != t.date():
-            n = news_today()
-            if n: await tg(session, n + f"\n\n🔴 High = pause 15 min before\n\n<i>{BRAND}</i>")
-            sent_n = t.date()
-        s = session()
-        key = t.strftime("%Y%m%d") + (s or "")
-        if s and t.minute < 2 and key not in opened:
-            opened.add(key)
-            note = {"ASIA": "Thin volume.", "LONDON": "Liquidity rising.",
-                    "NEW YORK": "Highest volume.", "NY PM": "Volume fading."}.get(s, "")
-            lines = [f"🔔 <b>{s}</b>  ·  {t.strftime('%H:%M EAT')}\n{note}\n"]
-            for st in STORES:
-                if st.name == "GOLD" and not gold_open(): continue
-                fm = flow(st if st.cvd else PROXIES.get(st.name, st))
-                d = fm["dir"] if fm else "NEUTRAL"
-                lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}  ·  {DIR_W[d]}")
-            await tg(session, "\n".join(lines))
-        if s and t.minute == 0 and t.hour in (4, 5, 6, 9, 10, 11, 14, 15, 16, 18, 19):
-            await tg(session, build_flow())
-        await asyncio.sleep(25)
 
 async def commands(session):
     offset = 0
@@ -662,55 +436,52 @@ async def commands(session):
                 if not text.startswith("/"): continue
                 c = text.split()[0].split("@")[0].lower()
                 if c == "/now": await tg(session, build_now())
-                elif c == "/flow": await tg(session, build_flow())
-                elif c == "/signal": await tg(session, build_signals())
-                elif c == "/dayoutlook": await tg(session, build_outlook())
-                elif c == "/sotd": await tg(session, build_sotd())
-                elif c == "/health": await tg(session, build_health())
+                elif c in ("/outlook", "/dayoutlook"): await tg(session, build_outlook())
+                elif c == "/health":
+                    await tg(session, f"<b>Status</b>\nSignals sent: {sig_count}\n"
+                                      f"Open: {list(active.keys()) or 'none'}\n"
+                                      f"Record TP/SL: {record['tp']}/{record['sl']}")
                 elif c in ("/help", "/start"): await tg(session, HELP)
-        except Exception as e: log.error(f"cmd: {e}")
+        except Exception as e:
+            log.error(f"cmd: {e}")
         await asyncio.sleep(1)
+
+async def schedule(session):
+    sent = None
+    while True:
+        t = now_eat()
+        if t.hour == 7 and t.minute < 2 and sent != t.date():
+            await tg(session, build_outlook())
+            sent = t.date()
+        await asyncio.sleep(30)
 
 # ─────────────────────────────────────────────────────────────
 app = Flask(__name__)
 @app.route("/")
-def root(): return jsonify(status="ok", service=BRAND)
+def root(): return jsonify(status="ok", engine="Zone + Reversal Probability", signals=sig_count)
 @app.route("/health")
 def health():
-    return jsonify(status="ok", time=now_eat().isoformat(), session=session(),
-                   assets={s.name: {"price": s.price, "age": round(s.age())} for s in STORES},
-                   signals=list(SIG.active.keys()), record=SIG.rec)
+    return jsonify(status="ok", time=now_eat().isoformat(),
+                   prices=last_px, zones={s: len(z) for s,z in zones.items()},
+                   active=list(active.keys()), record=record)
 
 def run_flask():
     app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
-STORES, PROXIES, H4 = [], {}, {}
-
 async def main():
-    global STORES, PROXIES
-    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25))
-    btc  = Store("BITCOIN", "btcusdt")
-    paxg = Store("PAXG", "paxgusdt")
-    gold = Store("GOLD")
-    STORES = [btc, gold]
-    PROXIES = {"GOLD": paxg, "BITCOIN": btc}
-    log.info(f"{BRAND} UNIFIED v5 starting")
-    await seed_btc(session, btc)
-    await seed_gold(session, gold)
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+    log.info(f"{BRAND} ZONE ENGINE (main logic) starting")
+    await seed(session)
     await tg(session,
-        f"✅ <b>{BRAND} Unified Desk is live</b>\n\n"
-        f"Real-time tape · Flow + Structure · Manipulation radar\n"
-        f"A+ signals only. Human desk voice.\n\n"
+        f"✅ <b>{BRAND} Zone Engine live</b>\n\n"
+        f"Main logic: Dynamic zones + reversal probability\n"
+        f"Wide stops · High R:R · Human desk voice\n\n"
         f"{now_eat().strftime('%H:%M EAT')}"
     )
     await asyncio.gather(
-        ws_loop([btc, paxg]),
-        gold_loop(session, gold),
-        h4_loop(session, H4, STORES),
-        news_worker(session),
-        tick(session, STORES, PROXIES, H4),
-        schedule(session),
+        signal_loop(session),
         commands(session),
+        schedule(session),
     )
 
 if __name__ == "__main__":
