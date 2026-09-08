@@ -251,7 +251,7 @@ def render_chart(st: CandleStore, out_path: str):
         return None
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
                                    gridspec_kw={"height_ratios": [3, 1]})
-    x = np.arange(len(df)
+    x = np.arange(len(df))
     up = df.c >= df.o
     ax1.vlines(x, df.l, df.h, color=np.where(up, "#26a69a", "#ef5350"), lw=0.8)
     ax1.bar(x, (df.c - df.o), 0.6, bottom=df.o,
@@ -348,4 +348,4 @@ Now translate this data:
 The desk is open and fully working now.  
 Run it and you will see perfect human updates every hour.  
 
-Let me know when you deploy it I’m here. 🚀
+Let me know when you deploy it — I’m here. 🚀
