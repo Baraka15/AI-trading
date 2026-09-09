@@ -2081,4 +2081,283 @@ async def daily_outlook_worker(stores, proxies, h4):
             # build real data context for AI
             ctx_bits = [f"Time: {t.strftime('%A %d %B %Y, %H:%M EAT')}"]
             for st in stores:
-                if st.name == "
+                if st.name == "GOLD" and not gold_market_open():
+                    continue
+                fs = st if st.cvd_ticks else proxies.get(st.name, st)
+                fm = flow_metrics(fs)
+                intra, wk = structure_read(st, h4)
+                vw = st.vwap()
+                smc = SMC_ENGINE.analyse(st)
+                pd_ = smc.get("pd")
+                bos = smc.get("bos")
+                bull_ob = smc.get("bull_ob")
+                bear_ob = smc.get("bear_ob")
+                liq = smc.get("liq", [])
+                p = st.price
+                ctx_bits.append(
+                    f"\n{st.name}: price {fp(p, st.name) if p else 'unknown'}, "
+                    f"flow {'BULLISH' if fm and fm['dir'] == 'BULL' else 'BEARISH' if fm and fm['dir'] == 'BEAR' else 'MIXED'}, "
+                    f"structure {'bullish' if intra == 'BULL' else 'bearish' if intra == 'BEAR' else 'neutral'} on 1h, "
+                    f"{'bullish' if wk == 'BULL' else 'bearish' if wk == 'BEAR' else 'neutral'} on 4h, "
+                    f"VWAP {fp(vw, st.name) if vw else 'not set'}, "
+                    f"zone: {pd_['zone'] if pd_ else 'unknown'} ({pd_['pct']:.0f}% of range)" if pd_ else ""
+                )
+                if bos: ctx_bits.append(f"Structure: {bos['label']}")
+                if bull_ob: ctx_bits.append(f"Bullish OB (demand zone): {fp(bull_ob['low'], st.name)}-{fp(bull_ob['high'], st.name)}")
+                if bear_ob: ctx_bits.append(f"Bearish OB (supply zone): {fp(bear_ob['low'], st.name)}-{fp(bear_ob['high'], st.name)}")
+                if liq: ctx_bits.append(f"Liquidity pools: " + ", ".join(f"{fp(l['level'], st.name)} ({l['type']}, {l['distance_pct']:+.1f}%)" for l in liq[:2]))
+            news = [e.get("title") for e in NEWS["events"] if e.get("impact") == "High"]
+            if news: ctx_bits.append(f"\nHigh-impact news today: {', '.join(news)}")
+            prompt = "\n".join(ctx_bits) + "\n\nWrite the morning trading outlook for the group. Give the bias, key levels to watch, two scenarios (if it holds X / if it breaks Y), and end with motivation or a reminder."
+            msg = await ai_voice(prompt, fallback=build_daily_outlook(stores, proxies, h4))
+            await tg_send(msg + f"\n\n<i>{FOOT}</i>")
+        await asyncio.sleep(60)
+
+async def news_brief_worker():
+    """Posts all today's economic events at 07:10 EAT — after the daily outlook.
+    Shows every event (High/Medium/Low) so traders know what's dropping all day."""
+    sent_for = None
+    while True:
+        t = now_eat()
+        if t.hour == 7 and 10 <= t.minute < 12 and sent_for != t.date():
+            brief = news_today_lines()
+            if brief:
+                await tg_send(brief + f"\n\n🔴 High = signals pause 15min before\n🟡 Medium = watch for volatility\n⚪ Low = FYI\n\n<i>{BRAND}</i>")
+            else:
+                await tg_send(f"📅 No scheduled events today.\n\n<i>{BRAND}</i>")
+            sent_for = t.date()
+        await asyncio.sleep(60)
+
+async def signal_of_day_worker(stores, proxies, h4):
+    """Auto-sends the confluence-based Signal of the Day at 07:05 EAT — 5 min after the
+    existing daily outlook so the two messages don't collide. Also available on-demand
+    via /sotd. Purely additive; does not alter daily_outlook_worker or SIGNAL_ENGINE."""
+    sent_for = None
+    while True:
+        t = now_eat()
+        if t.hour == 7 and 5 <= t.minute < 7 and sent_for != t.date():
+            msg = build_signal_of_the_day(stores, proxies, h4)
+            if msg:
+                await tg_send(msg)
+            sent_for = t.date()
+        await asyncio.sleep(60)
+
+async def session_worker(stores, proxies, h4, ctx):
+    opened = set()
+    SESSION_CHAR = {
+        "ASIA":     "Asian session just opened. Volume is thin early — traps are common here. Price can be deceptive.",
+        "LONDON":   "London just stepped in. This is where the real volume starts. Take the tape seriously now.",
+        "NEW YORK": "New York is here. This is the highest volume session of the day — if there's a move, this is where it happens.",
+        "NY PM":    "Afternoon session. London is closing out. Volume drops off. Better for managing open trades than finding new ones.",
+    }
+    while True:
+        t = now_eat()
+        s = session_name()
+        if s and t.minute < 2 and (t.strftime("%Y%m%d") + s) not in opened:
+            opened.add(t.strftime("%Y%m%d") + s)
+            if len(opened) > 20:
+                opened = set(list(opened)[-10:])
+            ctx_bits = [f"Session: {s} just opened, {t.strftime('%H:%M EAT')}",
+                        SESSION_CHAR.get(s, "Session live.")]
+            for st in stores:
+                if st.name == "GOLD" and not gold_market_open():
+                    continue
+                fs = st if st.cvd_ticks else proxies.get(st.name, st)
+                fm = flow_metrics(fs)
+                intra, wk = structure_read(st, h4)
+                smc = SMC_ENGINE.analyse(st)
+                vw = st.vwap()
+                liq = smc.get("liq", [])
+                bull_ob = smc.get("bull_ob"); bear_ob = smc.get("bear_ob")
+                p = st.price
+                ctx_bits.append(
+                    f"{st.name} at {fp(p, st.name) if p else '—'}, "
+                    f"tape {'bullish' if fm and fm['dir']=='BULL' else 'bearish' if fm and fm['dir']=='BEAR' else 'mixed'}, "
+                    f"VWAP {fp(vw, st.name) if vw else 'not set'}, "
+                    f"structure {'bullish' if intra=='BULL' else 'bearish' if intra=='BEAR' else 'neutral'}"
+                )
+                if bull_ob: ctx_bits.append(f"Demand zone (bullish OB): {fp(bull_ob['low'], st.name)}-{fp(bull_ob['high'], st.name)}")
+                if bear_ob: ctx_bits.append(f"Supply zone (bearish OB): {fp(bear_ob['low'], st.name)}-{fp(bear_ob['high'], st.name)}")
+                if liq: ctx_bits.append("Liquidity resting at: " + ", ".join(f"{fp(l['level'], st.name)} ({l['type']})" for l in liq[:2]))
+            prompt = "\n".join(ctx_bits) + "\n\nWrite a session open update for traders. What just opened, what's the bias, what levels matter, and what are the two scenarios they should watch for. End with encouragement or a warning."
+            msg = await ai_voice(prompt, fallback=f"🔔 {s} open — {t.strftime('%H:%M EAT')}\n" + "\n".join(ctx_bits[2:]))
+            await tg_send(msg + f"\n\n<i>{FOOT}</i>")
+        if not s and now_eat().hour >= 21:
+            opened = set()
+        await asyncio.sleep(60)
+
+async def close_worker(stores):
+    sent_for = None
+    while True:
+        t = now_eat()
+        if t.hour == 21 and 0 <= t.minute < 2 and sent_for != t.date():
+            sent_for = t.date()
+            ctx_bits = [f"NY session just closed. Date: {t.strftime('%A %d %B')}"]
+            for st in stores:
+                df = st.df("1h", 24)
+                if not df.empty and st.price:
+                    hi, lo = float(df.h.max()), float(df.l.min())
+                    pos = (st.price - lo) / (hi - lo) * 100 if hi != lo else 50
+                    pos_w = "near the highs" if pos > 70 else ("near the lows" if pos < 30 else "mid-range")
+                    ctx_bits.append(f"{st.name} closed at {fp(st.price, st.name)}, {pos_w}, 24h range {fp(lo, st.name)} to {fp(hi, st.name)}")
+            rec = SIGNAL_ENGINE.record_line()
+            ctx_bits.append(f"Today's record: {rec}")
+            prompt = "\n".join(ctx_bits) + "\n\nWrite a day close message for the trading group. How did the day go, where did each asset close, what should traders think about overnight or for tomorrow. Keep it short and real."
+            msg = await ai_voice(prompt, fallback="🌙 NY close — books shut. See you tomorrow.")
+            await tg_send(msg + f"\n\n<i>{FOOT}</i>")
+            await asyncio.sleep(120)
+        await asyncio.sleep(60)
+
+def build_weekend_review() -> str:
+    t = now_eat()
+    lines = [f"📋 <b>WEEK CLOSED · {t.strftime('%d %b')}</b>\n"]
+    for st in STORES:
+        df = st.df("1h", 120)
+        if len(df) >= 24 and st.price:
+            hi = float(df.tail(120).h.max())
+            lo = float(df.tail(120).l.min())
+            pos = (st.price - lo) / (hi - lo) * 100 if hi != lo else 50
+            pos_w = "near highs" if pos > 70 else ("near lows" if pos < 30 else "mid-range")
+            rng_pct = (hi - lo) / lo * 100 if lo else 0
+            lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}  ·  {pos_w}  "
+                         f"5d {fp(lo, st.name)}–{fp(hi, st.name)}  ({rng_pct:.1f}% week)")
+    lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}\nReopen Sun 21:30 EAT. Watch for gap.")
+    return "\n".join(lines) + footer()
+
+async def weekend_worker(stores, h4):
+    sent_sat = sent_sun = None
+    while True:
+        t = now_eat()
+        if t.weekday() == 5 and t.hour == 10 and t.minute < 2 and sent_sat != t.date():
+            sent_sat = t.date()
+            await tg_send(build_weekend_review())
+        if t.weekday() == 6 and t.hour == 21 and 30 <= t.minute < 32 and sent_sun != t.date():
+            sent_sun = t.date()
+            gold_t = gold_next_open_eat().strftime("%H:%M EAT")
+            await tg_send(
+                f"🟢 <b>MARKETS OPEN</b>\n"
+                f"BTC live. Gold opens {gold_t}.\n"
+                f"First 15min noisy — wait for flow to settle.\n\n<i>{BRAND}</i>"
+            )
+        await asyncio.sleep(60)
+
+# ---------------------------------------------------------------- COMMANDS
+async def command_worker():
+    offset = 0
+    while True:
+        try:
+            async with HTTP.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+                                f"?timeout=25&offset={offset}") as r:
+                data = await r.json()
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                if not text.startswith("/"):
+                    continue
+                cmd = text.split()[0].split("@")[0].lower()
+                if cmd == "/now":
+                    await tg_send(build_now())
+                elif cmd == "/flow":
+                    await tg_send(build_flow_report())
+                elif cmd == "/weekend":
+                    await tg_send(build_weekend_review())
+                elif cmd == "/smc":
+                    for st in STORES:
+                        if st.name == "GOLD" and not gold_market_open():
+                            continue
+                        await tg_send(SMC_ENGINE.format(st))
+                elif cmd == "/dayoutlook":
+                    await tg_send(build_daily_outlook(STORES, PROXIES, H4))
+                elif cmd == "/signal":
+                    png = render_chart_bytes(next(s for s in STORES if s.name == "BITCOIN"))
+                    card = build_signal_card()
+                    if png and SIGNAL_ENGINE.active:
+                        await tg_photo(png, card)
+                    else:
+                        await tg_send(card)
+                elif cmd == "/health":
+                    await tg_send(build_health())
+                elif cmd == "/sotd":
+                    await tg_send(build_signal_of_the_day(STORES, PROXIES, H4))
+                elif cmd in ("/help", "/start"):
+                    await tg_send(HELP_TEXT)
+        except Exception as e:
+            log.error(f"commands: {e}")
+        await asyncio.sleep(1)
+
+# ---------------------------------------------------------------- FLASK HEALTH SERVER
+app = Flask(__name__)
+
+@app.route("/")
+def root():
+    return jsonify({
+        "status": "ok",
+        "service": BRAND,
+        "health": "/health",
+    })
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "time": now_eat().isoformat(),
+        "session": session_name(),
+        "assets": {s.name: {"price": s.price, "source": s.source,
+                            "age_s": round(s.data_age())} for s in STORES},
+        "signals_open": list(SIGNAL_ENGINE.active.keys()),
+        "record": SIGNAL_ENGINE.record,
+        "context": {name: {k: v for k, v in c.items()} for name, c in CTX.items()},
+        "cross_exchange": CROSS_EX,
+        "liquidations_5m_usd": round(sum(
+            x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 300)),
+    })
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
+# ---------------------------------------------------------------- MAIN
+STORES, PROXIES, H4, CTX = [], {}, {}, {}
+
+async def main_async():
+    global HTTP
+    HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+    btc  = CandleStore("BITCOIN", ws_sym="btcusdt")
+    paxg = CandleStore("PAXG", ws_sym="paxgusdt")    # gold derivatives proxy — live tape
+    gold = CandleStore("GOLD")
+
+    STORES.clear(); STORES.extend([btc, gold])
+    PROXIES["GOLD"] = paxg
+    PROXIES["BITCOIN"] = btc
+
+    log.info(f"{BRAND} starting — assets: BITCOIN, GOLD")
+
+    # bootstraps (sequential — clean logs)
+    await bootstrap_crypto([btc, paxg])
+    await bootstrap_gold(gold)
+
+    tasks = [
+        asyncio.create_task(binance_worker([btc, paxg])),
+        asyncio.create_task(crypto_rest_fallback([btc, paxg])),
+        asyncio.create_task(gold_worker(gold)),
+        asyncio.create_task(h4_worker(H4)),
+        asyncio.create_task(context_worker(CTX)),
+        asyncio.create_task(liquidation_worker()),
+        asyncio.create_task(cross_exchange_worker(STORES)),
+        asyncio.create_task(news_worker()),
+        asyncio.create_task(news_brief_worker()),
+        asyncio.create_task(tick_worker(STORES, PROXIES, H4, CTX)),
+        asyncio.create_task(flow_update_worker(STORES)),
+        asyncio.create_task(daily_outlook_worker(STORES, PROXIES, H4)),
+        asyncio.create_task(signal_of_day_worker(STORES, PROXIES, H4)),
+        asyncio.create_task(session_worker(STORES, PROXIES, H4, CTX)),
+        asyncio.create_task(close_worker(STORES)),
+        asyncio.create_task(weekend_worker(STORES, H4)),
+        asyncio.create_task(command_worker()),
+    ]
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    Thread(target=run_flask, daemon=True).start()
+    asyncio.run(main_async())
