@@ -971,67 +971,79 @@ class SMCEngine:
 
     # ── Human-readable output ─────────────────────────────────────────────────
     def format(self, st: CandleStore) -> str:
-        """Compact SMC read — one section per concept, max 20 lines total."""
+        """Full SMC analysis in human trader language — no labels, just talk."""
         res = self.analyse(st)
         if not res:
-            return f"<b>{st.name}</b> — not enough data yet."
+            return f"{st.name} — not enough candle data yet for a full SMC read."
         n = st.name
         p = st.price
-        lines = [f"📐 <b>SMC · {n}</b>  {fp(p, n) if p else '—'}\n"]
+        price_str = fp(p, n) if p else "—"
+        parts = []
 
-        # Premium/Discount
+        # Price zone — where are we in the range?
         pd = res.get("pd")
         if pd:
-            lines.append(f"📍 <b>Price zone</b>  {pd['pct']:.0f}% of range — {pd['zone']}")
-            lines.append(f"   Range {fp(pd['lo'], n)} – {fp(pd['hi'], n)}  ·  Mid {fp(pd['mid'], n)}")
+            if pd["pct"] > 75:
+                zone_line = (f"{n} is at {price_str}, deep in premium territory — top {100-pd['pct']:.0f}% of the range. "
+                             f"This is where smart money typically looks to sell. The full range runs {fp(pd['lo'],n)} to {fp(pd['hi'],n)}.")
+            elif pd["pct"] < 25:
+                zone_line = (f"{n} is at {price_str}, deep in discount — bottom {pd['pct']:.0f}% of the range. "
+                             f"This is where smart money looks to buy. Range is {fp(pd['lo'],n)} to {fp(pd['hi'],n)}.")
+            else:
+                zone_line = (f"{n} at {price_str}, sitting in the middle of the range ({pd['pct']:.0f}%). "
+                             f"Fair value zone — no clear edge from price position alone.")
+            parts.append(zone_line)
 
-        # Structure (BOS + CHOCH)
-        bos  = res.get("bos")
+        # Structure
+        bos = res.get("bos")
         choch = res.get("choch")
         if choch:
-            lines.append(f"\n🔄 <b>CHOCH</b>  {choch['label']}")
-        if bos:
-            lines.append(f"{'✅' if not choch else '📊'} <b>BOS</b>  {bos['label']}")
+            parts.append(f"Structure is showing a change of character — {choch['label']}. This is the first sign of a potential trend reversal. Watch carefully.")
+        elif bos:
+            parts.append(f"Structure confirmed — {bos['label']}. Trend is intact.")
 
         # Order Blocks
         bull_ob = res.get("bull_ob")
         bear_ob = res.get("bear_ob")
         if bull_ob and p:
             dist = (bull_ob["mid"] - p) / p * 100
-            label = "below — demand zone to watch" if dist < 0 else "above — already passed"
-            lines.append(f"\n🟩 <b>Bullish OB</b>  {fp(bull_ob['low'], n)} – {fp(bull_ob['high'], n)}  ·  {label}")
+            if dist < 0:
+                parts.append(f"Bullish order block sitting below at {fp(bull_ob['low'],n)}–{fp(bull_ob['high'],n)} — that's a key demand zone. If price pulls back there, watch for a reaction and a potential long setup.")
         if bear_ob and p:
             dist = (bear_ob["mid"] - p) / p * 100
-            label = "above — supply zone to watch" if dist > 0 else "below — already passed"
-            lines.append(f"🟥 <b>Bearish OB</b>  {fp(bear_ob['low'], n)} – {fp(bear_ob['high'], n)}  ·  {label}")
+            if dist > 0:
+                parts.append(f"Bearish order block above at {fp(bear_ob['low'],n)}–{fp(bear_ob['high'],n)} — supply zone. If price runs up there, watch for rejection and a short opportunity.")
 
         # Fair Value Gaps
         bull_fvg = res.get("bull_fvg")
         bear_fvg = res.get("bear_fvg")
-        if bull_fvg:
-            filled = p and p < bull_fvg["low"]
-            lines.append(f"\n⬜ <b>Bullish FVG</b>  {fp(bull_fvg['low'], n)} – {fp(bull_fvg['high'], n)}"
-                         f"{'  ✓ filled' if filled else '  — unfilled, price likely returns'}")
-        if bear_fvg:
-            filled = p and p > bear_fvg["high"]
-            lines.append(f"⬛ <b>Bearish FVG</b>  {fp(bear_fvg['low'], n)} – {fp(bear_fvg['high'], n)}"
-                         f"{'  ✓ filled' if filled else '  — unfilled, price likely returns'}")
+        if bull_fvg and p and p > bull_fvg["low"]:
+            parts.append(f"There's an unfilled bullish gap between {fp(bull_fvg['low'],n)} and {fp(bull_fvg['high'],n)} — price tends to come back and fill these. That zone is also a potential entry area for longs.")
+        if bear_fvg and p and p < bear_fvg["high"]:
+            parts.append(f"Unfilled bearish gap at {fp(bear_fvg['low'],n)}–{fp(bear_fvg['high'],n)} — price left an imbalance here and could return to fill it.")
 
-        # Liquidity Pools
+        # Liquidity
         liq = res.get("liq", [])
-        if liq:
-            lines.append("\n💧 <b>Liquidity pools</b> (stop clusters — likely targets)")
-            for pool in liq[:3]:
-                direction = "above" if pool["distance_pct"] > 0 else "below"
-                lines.append(f"   {fp(pool['level'], n)}  {direction}  "
-                             f"({abs(pool['distance_pct']):.2f}% away)  ·  {pool['type']}")
+        above = [l for l in liq if l["distance_pct"] > 0][:2]
+        below = [l for l in liq if l["distance_pct"] < 0][:2]
+        liq_parts = []
+        if above:
+            liq_parts.append("above at " + ", ".join(f"{fp(l['level'],n)} ({l['type']})" for l in above))
+        if below:
+            liq_parts.append("below at " + ", ".join(f"{fp(l['level'],n)} ({l['type']})" for l in below))
+        if liq_parts:
+            parts.append(f"Liquidity pools — stop clusters resting {" and ".join(liq_parts)}. Smart money targets these before reversing.")
 
-        # SMC bias
+        # Bias conclusion
         bias = self._smc_bias(res, p)
-        if bias:
-            lines.append(f"\n{bias}")
+        if "LONG" in bias:
+            parts.append("Overall SMC read is LONG — price in discount, structure supports buys. Wait for a pullback into the order block or FVG for entry. Don't buy into premium.")
+        elif "SHORT" in bias:
+            parts.append("Overall SMC read is SHORT — price in premium, structure supports sells. Look for rejection from the order block or FVG for entry. Don't sell into discount.")
+        else:
+            parts.append("SMC read is NEUTRAL — conflicting signals. No clean setup from price structure right now.")
 
-        return "\n".join(lines) + f"\n\n<i>{BRAND}</i>"
+        return "\n\n".join(parts) + f"\n\n<i>{BRAND}</i>"
 
     @staticmethod
     def _smc_bias(res: dict, price: float) -> str:
@@ -1693,68 +1705,94 @@ def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
     fs = st if st.cvd_ticks else proxy
     fm = flow_metrics(fs)
     fl = fm["dir"] if fm else "NEUTRAL"
-    _, grade = agreement_full(intra, wk, fl)
 
-    # line 1 — asset + price + range tag
+    # Header line
     df24 = st.df("1h", 24)
     range_tag = ""
     if not df24.empty and p:
         hi, lo = float(df24.h.max()), float(df24.l.min())
         if hi > lo:
-            pos = (p - lo) / (hi - lo) * 100
-            range_tag = " · near highs" if pos > 75 else (" · near lows" if pos < 25 else " · mid-range")
-    status = DIR_EMOJI[fl] if fl != "NEUTRAL" else "⚪"
-    l1 = f"{status} <b>{n}</b>  {fp(p, n) if p else '—'}{range_tag}"
+            pos_pct = (p - lo) / (hi - lo) * 100
+            range_tag = (", near the highs" if pos_pct > 75 else
+                         ", upper half" if pos_pct > 55 else
+                         ", mid-range" if pos_pct > 40 else
+                         ", lower half" if pos_pct > 20 else
+                         ", pressing the lows")
+    status = "🟢" if fl == "BULL" else "🔴" if fl == "BEAR" else "⚪"
+    lines = [f"{status} <b>{n}</b>  {fp(p, n) if p else '—'}{range_tag}"]
 
-    # line 2 — core read
-    if fm and fl != "NEUTRAL":
-        conv_s = {"High": "high conv", "Medium": "med conv", "Low": "low conv"}.get(fm["conv"], "")
-        reg_s  = {"ACCUMULATION":"accumulating","DISTRIBUTION":"distributing",
-                  "PULLBACK-BUYING":"buying dips","RALLY-SELLING":"selling rallies",
-                  "CHOP":"choppy"}.get(fm.get("regime",""), "")
-        _, acc = cvd_acceleration(fs)
-        acc_s  = " · accel ↑" if "accel" in acc else (" · fading ↓" if "fading" in acc else "")
-        l2 = f"{DIR_WORD[fl]} · Grade {grade} · {conv_s} · {reg_s}{acc_s}"
-    else:
-        l2 = f"Grade {grade} · warming up"
-
-    # line 3 — VWAP
-    l3 = ""
+    # Tape read in plain English
     vw = st.vwap()
-    if vw and p:
-        dev = st.vwap_dev_pct()
-        _, vwup, vwdn = vwap_bands(st)
-        s_note = " ⚠️ stretched" if vwup and (p >= vwup or p <= vwdn) else ""
-        l3 = f"VWAP {fp(vw, n)}  {'▲' if dev > 0 else '▼'}{abs(dev):.1f}%{s_note}"
+    _, acc = cvd_acceleration(fs)
+    if fm and fl != "NEUTRAL":
+        conv_word = {"High": "high conviction", "Medium": "moderate conviction", "Low": "low conviction"}.get(fm["conv"], "")
+        regime_word = {"ACCUMULATION": "tape has been accumulating",
+                       "DISTRIBUTION": "tape has been distributing",
+                       "PULLBACK-BUYING": "buyers stepping in on every dip",
+                       "RALLY-SELLING": "sellers pressing every rally",
+                       "CHOP": "mixed tape — both sides active"}.get(fm.get("regime", ""), "")
+        acc_note = (", momentum is building" if "accel" in acc else
+                    ", flow is starting to fade" if "fading" in acc else "")
+        dir_word = "bullish" if fl == "BULL" else "bearish"
+        tape_line = f"{dir_word.capitalize()} tape, {conv_word} — {regime_word}{acc_note}."
+        if vw and p:
+            dev = (p - vw) / vw * 100
+            _, vwup, vwdn = vwap_bands(st)
+            if vwup and (p >= vwup or p <= vwdn):
+                tape_line += f" Running {abs(dev):.1f}% {'above' if dev > 0 else 'below'} VWAP ({fp(vw, n)}) — stretched."
+            elif abs(dev) > 0.15:
+                tape_line += f" {abs(dev):.1f}% {'above' if dev > 0 else 'below'} VWAP {fp(vw, n)}."
+        lines.append(tape_line)
+    elif fm and fl == "NEUTRAL":
+        lines.append("Tape is balanced — no clear edge right now.")
+    else:
+        if vw and p:
+            lines.append(f"Flow warming up. Price is {'above' if p > vw else 'below'} VWAP at {fp(vw, n)}.")
+        else:
+            lines.append("Flow warming up — no read yet.")
 
-    # line 4 — positioning (compact)
-    pos = []
-    if "funding" in c:
-        fr = c["funding"]
-        pos.append("longs paying" if fr > 0.01 else ("shorts paying" if fr < -0.01 else "funding flat"))
-    if c.get("oi_chg_pct") is not None:
-        chg = c["oi_chg_pct"]
-        pos.append("OI ↑" if chg > 0.05 else ("OI ↓" if chg < -0.05 else ""))
-    if "book" in c and abs(c["book"]) > 8:
-        pos.append(f"book {'bid' if c['book'] > 0 else 'ask'}-heavy")
-    l4 = " · ".join(x for x in pos if x)
+    # Positioning
+    pos_parts = []
+    fr = c.get("funding")
+    if fr is not None:
+        recent_f = [f for t_, f in FUNDING_HIST if t_ >= time.time() - 7200]
+        trend_note = ""
+        if len(recent_f) >= 3:
+            delta = recent_f[-1] - recent_f[0]
+            trend_note = (", rising" if delta > 0.001 else ", falling" if delta < -0.001 else "")
+        pos_parts.append("longs paying" + trend_note if fr > 0.01 else
+                         "shorts paying" + trend_note if fr < -0.01 else
+                         "funding flat" + trend_note)
+    oi_chg = c.get("oi_chg_pct")
+    if oi_chg is not None:
+        if oi_chg > 0.05:
+            pos_parts.append("OI growing — new money entering")
+        elif oi_chg < -0.05:
+            pos_parts.append("OI shrinking — positions closing")
+    bk = c.get("book")
+    if bk and abs(bk) > 8:
+        pos_parts.append(f"book {'bid' if bk > 0 else 'ask'}-heavy")
+    if pos_parts:
+        lines.append(", ".join(pos_parts).capitalize() + ".")
 
-    # line 5 — key levels + cross-ex
+    # Key levels
     bid_w, ask_w = c.get("bid_wall"), c.get("ask_wall")
-    l5 = ""
-    if bid_w and ask_w:
-        xex_tag = ""
-        if n == "BITCOIN":
-            xex = CROSS_EX.get("BITCOIN")
-            if xex and time.time() - xex.get("ts", 0) < 120:
-                xex_tag = "  ⚠️ venue gap" if abs(xex["divergence_pct"]) >= 0.15 else "  CB ✓"
-        l5 = (f"Bid ${bid_w['usd']//1000}k @ {fp(bid_w['price'], n)}  "
-              f"Ask ${ask_w['usd']//1000}k @ {fp(ask_w['price'], n)}{xex_tag}")
+    if bid_w and ask_w and p:
+        close_wall = ask_w["usd"] >= 80_000 and abs(ask_w["price"] - p) / p < 0.005
+        wall_note = " — wall right in the way" if close_wall else ""
+        lines.append(f"Bid ${bid_w['usd']//1000}k at {fp(bid_w['price'], n)}, "
+                     f"ask ${ask_w['usd']//1000}k at {fp(ask_w['price'], n)}{wall_note}.")
+
+    # Cross-exchange
+    if n == "BITCOIN":
+        xex = CROSS_EX.get("BITCOIN")
+        if xex and time.time() - xex.get("ts", 0) < 120:
+            div = xex["divergence_pct"]
+            lines.append("⚠️ Binance and Coinbase diverging." if abs(div) >= 0.15 else "Coinbase in line ✓")
 
     age = st.data_age()
-    feed = f"{'🟢' if age < STALE_FEED_SEC else '🔴'} {st.source}"
-
-    return "\n".join(x for x in [l1, l2, l3, l4, l5, feed] if x)
+    lines.append(f"{'🟢' if age < STALE_FEED_SEC else '🔴'} {st.source}")
+    return "\n".join(lines)
 
 def build_daily_outlook(stores, proxies, h4) -> str:
     t = now_eat()
@@ -1890,21 +1928,30 @@ def build_signal_of_the_day(stores, proxies, h4) -> str:
             arrow = "▲ LONG" if d["dir"] == "BULL" else "▼ SHORT"
             medal = "🥇" if i == 0 else "🥈"
             key_reason = d["reasons"][0] if d["reasons"] else ""
-            lines.append(
-                f"{medal} <b>{n}</b>  {price_str} · <b>{arrow} · {d['score']}/10</b>\n"
-                f"{key_reason.capitalize()}."
-            )
+            dir_word = "long" if d["dir"] == "BULL" else "short"
+            reason_text = key_reason if key_reason else "structure and flow aligned"
+            asset_openers = {
+                "BULL": [f"Best long setup today is {n} at {price_str}.",
+                         f"{n} at {price_str} — this is the one to watch on the long side."],
+                "BEAR": [f"Best short setup today is {n} at {price_str}.",
+                         f"{n} at {price_str} — leaning short on this one."],
+            }
+            opener = random.choice(asset_openers.get(d["dir"], [f"{n} at {price_str}."]))
+            medal_word = "Top pick" if i == 0 else "Second read"
+            lines.append(f"{medal} {opener} {medal_word}, {d['score']}/10 confluence. {reason_text.capitalize()}.")
 
-    lines.append(
-        random.choice([
-            "Bias only. /signal fires with entry, SL, TP.",
-            "Direction only — /signal gives the exact levels.",
-            "Wait for /signal before entering. This is the lean, not the trigger.",
-        ]) if any_clean else random.choice([
-            "Nothing clean on either asset. Patience.",
-            "Mixed on both. No call today.",
-        ])
-    )
+    if any_clean:
+        lines.append(random.choice([
+            "This is the directional bias for today. We don't enter here — we wait for /signal to fire with exact entry, stop, and targets. No setup, no trade.",
+            "Bias only — this is the lean, not the trigger. /signal fires when the full confluence lines up with an exact entry level.",
+            "Use this to know which side we're on. Execution comes from /signal. REMEMBER — we only trade setups ‼️",
+        ]))
+    else:
+        lines.append(random.choice([
+            "No clean setup on either asset today. The market isn't giving us anything clear — we wait. Patience is a position.",
+            "Mixed signals on both. No call. Better to miss a trade than force a bad one.",
+            "Nothing worth calling today. We stay flat and wait for the market to show its hand.",
+        ]))
     lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}")
     return "\n\n".join(lines) + footer()
 
@@ -1916,60 +1963,93 @@ def build_now() -> str:
         lines.append("")
     if SIGNAL_ENGINE.active:
         for n, s in SIGNAL_ENGINE.active.items():
-            arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
-            lines.append(f"🎯 Open signal: {n} {arrow} · {s['score']}/{SIGNAL_MAX_SCORE} · "
-                         f"entry {fp(s['entry'], n)} · SL {fp(s['sl'], n)} · "
-                         f"TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
+            side = "long" if s["dir"] == "BULL" else "short"
+            age_min = int((time.time() - s["t"]) / 60)
+            lines.append(f"🎯 We're in a {n} {side} — entry {fp(s['entry'], n)}, "
+                         f"stop {fp(s['sl'], n)}, TP1 {fp(s['tp1'], n)}, TP2 {fp(s['tp2'], n)}. "
+                         f"Open {age_min}min. Don't touch the stop until TP1 hits.")
     lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
     return "\n".join(lines) + footer()
 
 def build_flow_report() -> str:
     t_str = now_eat().strftime("%H:%M EAT")
-    lines = [f"📊 <b>FLOW · {t_str}</b>"]
+    sess = session_name() or "market"
+    openers = [
+        f"Quick tape check — {t_str}.",
+        f"Here's where things stand right now — {t_str}.",
+        f"Tape read — {t_str}.",
+    ]
+    blocks = [random.choice(openers)]
     for st in STORES:
+        if st.name == "GOLD" and not gold_market_open():
+            continue
         fs = st if st.cvd_ticks else PROXIES.get(st.name, st)
         fm = flow_metrics(fs)
         c = CTX.get(st.name, {})
-        price = fp(st.price, st.name) if st.price else "—"
-        if fm and fm["dir"] != "NEUTRAL":
-            _, acc = cvd_acceleration(fs)
-            acc_s = " · accel ↑" if "accel" in acc else (" · fading ↓" if "fading" in acc else "")
-            row1 = f"<b>{st.name}</b>  {price}  ·  {DIR_WORD[fm['dir']]} · {fm['conv'].lower()} conv{acc_s}"
-            row2 = f"CVD 15m {fm['c15']:+,.0f} · 1h {fm['c1h']:+,.0f}"
-        else:
-            row1 = f"<b>{st.name}</b>  {price}  ·  warming up"
-            row2 = ""
+        p = st.price
+        vw = st.vwap()
         bid_w, ask_w = c.get("bid_wall"), c.get("ask_wall")
-        walls = ""
+        _, acc = cvd_acceleration(fs)
+
+        if fm and fm["dir"] != "NEUTRAL":
+            dir_word = "bullish" if fm["dir"] == "BULL" else "bearish"
+            conv_word = {"High":"high conviction","Medium":"moderate conviction","Low":"low conviction"}.get(fm["conv"],"")
+            regime_word = {"ACCUMULATION":"accumulating","DISTRIBUTION":"distributing",
+                          "PULLBACK-BUYING":"buyers stepping in on dips","RALLY-SELLING":"sellers pressing every rally",
+                          "CHOP":"mixed"}.get(fm.get("regime",""),"")
+            acc_note = (", momentum building" if "accel" in acc else ", flow fading" if "fading" in acc else "")
+            tape_line = f"{st.name} at {fp(p,st.name) if p else '—'} — {dir_word} tape, {conv_word}, {regime_word}{acc_note}."
+            if vw and p:
+                dev = (p - vw) / vw * 100
+                tape_line += f" {abs(dev):.1f}% {'above' if dev>0 else 'below'} VWAP {fp(vw, st.name)}."
+        else:
+            tape_line = f"{st.name} at {fp(p,st.name) if p else '—'} — tape is mixed, no clean read."
+
+        level_line = ""
         if bid_w and ask_w:
-            xex = ""
+            xex_note = ""
             if st.name == "BITCOIN":
                 x = CROSS_EX.get("BITCOIN")
-                if x and time.time() - x.get("ts", 0) < 120:
-                    xex = "  ⚠️ gap" if abs(x["divergence_pct"]) >= 0.15 else "  CB ✓"
-            walls = (f"Bid ${bid_w['usd']//1000}k@{fp(bid_w['price'], st.name)}  "
-                     f"Ask ${ask_w['usd']//1000}k@{fp(ask_w['price'], st.name)}{xex}")
-        liq_1h = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 3600) if st.name == "BITCOIN" else 0
-        liq_s = f"  ·  liqs 1h ${liq_1h/1e6:.1f}M" if liq_1h > 500_000 else ""
-        block = "\n".join(x for x in [row1, row2, walls + liq_s] if x)
-        lines.append(block)
-    return "\n\n".join(lines) + footer()
+                if x and time.time() - x.get("ts",0) < 120:
+                    xex_note = " Coinbase diverging." if abs(x["divergence_pct"]) >= 0.15 else " Coinbase in line ✓"
+            level_line = (f"Bid ${bid_w['usd']//1000}k at {fp(bid_w['price'],st.name)}, "
+                         f"ask ${ask_w['usd']//1000}k at {fp(ask_w['price'],st.name)}.{xex_note}")
+
+        liq_note = ""
+        if st.name == "BITCOIN":
+            liq_1h = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time()-3600)
+            if liq_1h > 500_000:
+                liq_note = f"${liq_1h/1e6:.1f}M liquidated in the last hour."
+
+        block = "\n".join(x for x in [tape_line, level_line, liq_note] if x)
+        blocks.append(block)
+    return "\n\n".join(blocks) + footer()
 
 def build_signal_card() -> str:
-    t_str = now_eat().strftime("%H:%M EAT")
-    lines = [f"📊 <b>SIGNALS · {t_str}</b>\n"]
+    lines = []
     if SIGNAL_ENGINE.active:
         for n, s in SIGNAL_ENGINE.active.items():
-            arrow = "▲ LONG" if s["dir"] == "BULL" else "▼ SHORT"
+            side = "long" if s["dir"] == "BULL" else "short"
             age_min = int((time.time() - s["t"]) / 60)
             max_s = SIGNAL_MAX_SCORE if n == "BITCOIN" else SIGNAL_MAX_SCORE - 1
-            lines.append(f"<b>{n} · {arrow}</b>  {s['score']}/{max_s}  ·  open {age_min}min")
-            lines.append(f"Entry {fp(s['entry'], n)} · SL {fp(s['sl'], n)}")
+            trade_line = random.choice([
+                f"We're in a {n} {side}. Been running {age_min} minutes.",
+                f"Open {n} {side} trade — {age_min} minutes in.",
+                f"Active {n} {side} — {age_min}min and counting.",
+            ])
+            lines.append(trade_line)
+            lines.append(f"Entry {fp(s['entry'], n)} · Stop {fp(s['sl'], n)}")
             lines.append(f"TP1 {fp(s['tp1'], n)} · TP2 {fp(s['tp2'], n)}")
+            lines.append("Move your stop to breakeven once TP1 hits." if not s.get("tp1_hit") else "TP1 done — stop should be at breakeven, riding to TP2.")
     else:
-        lines.append(f"No open signals · bar ≥{SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE}")
+        no_trade_lines = [
+            f"No open trade right now. We're waiting for the next A+ setup — minimum {SIGNAL_MIN_SCORE}/{SIGNAL_MAX_SCORE} confluence before we enter.",
+            f"Nothing open. Desk is flat, watching for a clean setup. No setup, no trade.",
+            f"Standing aside right now. No signal has fired today — we don't force entries.",
+        ]
+        lines.append(random.choice(no_trade_lines))
     today = SIGNAL_ENGINE.counts.get(now_eat().strftime("%Y-%m-%d"), 0)
-    lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}  ·  Today {today}/{MAX_SIGNALS_DAY}")
+    lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()} · Today {today}/{MAX_SIGNALS_DAY} signals used")
     return "\n".join(lines) + footer()
 
 def build_health() -> str:
@@ -2318,18 +2398,30 @@ async def close_worker(stores):
 
 def build_weekend_review() -> str:
     t = now_eat()
-    lines = [f"📋 <b>WEEK CLOSED · {t.strftime('%d %b')}</b>\n"]
+    openers = [
+        f"Week's done. Let's look at where everything closed — {t.strftime('%d %b')}.",
+        f"That's the trading week wrapped. Here's the recap for {t.strftime('%d %b')}.",
+        f"Markets are closed. Good week or bad week, we reset on Monday. Here's where things finished.",
+    ]
+    lines = [random.choice(openers) + "\n"]
     for st in STORES:
         df = st.df("1h", 120)
         if len(df) >= 24 and st.price:
             hi = float(df.tail(120).h.max())
             lo = float(df.tail(120).l.min())
             pos = (st.price - lo) / (hi - lo) * 100 if hi != lo else 50
-            pos_w = "near highs" if pos > 70 else ("near lows" if pos < 30 else "mid-range")
             rng_pct = (hi - lo) / lo * 100 if lo else 0
-            lines.append(f"<b>{st.name}</b>  {fp(st.price, st.name)}  ·  {pos_w}  "
-                         f"5d {fp(lo, st.name)}–{fp(hi, st.name)}  ({rng_pct:.1f}% week)")
-    lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}\nReopen Sun 21:30 EAT. Watch for gap.")
+            if pos > 70:
+                pos_comment = "closed near the highs — bulls had control this week"
+            elif pos < 30:
+                pos_comment = "closed near the lows — bears were in control"
+            else:
+                pos_comment = "closed mid-range — no dominant side this week"
+            lines.append(f"{st.name} finished at {fp(st.price, st.name)}, {pos_comment}. "
+                         f"Week range was {fp(lo, st.name)} to {fp(hi, st.name)} — a {rng_pct:.1f}% move.")
+    rec = SIGNAL_ENGINE.record_line()
+    lines.append(f"\n🎯 {rec}")
+    lines.append("\nMarkets reopen Sunday 21:30 EAT. Don't trade the first 15 minutes — wait for the price to settle. Watch for weekend gaps. Fund those accounts and get ready for next week. 💪")
     return "\n".join(lines) + footer()
 
 async def weekend_worker(stores, h4):
@@ -2364,30 +2456,70 @@ async def command_worker():
                 if not text.startswith("/"):
                     continue
                 cmd = text.split()[0].split("@")[0].lower()
+
+                async def ai_send(static_msg: str, prompt_suffix: str = ""):
+                    """Send message through AI if keys available, otherwise send static."""
+                    if not (GEMINI_KEY or GROQ_KEY):
+                        await tg_send(static_msg)
+                        return
+                    # Strip HTML tags for cleaner AI context
+                    import re
+                    clean = re.sub(r'<[^>]+>', '', static_msg).strip()
+                    prompt = (
+                        f"Here's the real market data for our trading group:\n\n{clean}\n\n"
+                        f"Rewrite this as a natural human trader talking to their Telegram group. "
+                        f"Keep ALL the exact numbers and prices — never change a number. "
+                        f"No bullet points, no labels, no colons before data. "
+                        f"Sound like a real person typing on their phone. "
+                        f"Vary the opening so it's never the same twice. "
+                        + (prompt_suffix or "Max 7 sentences.")
+                    )
+                    result = await ai_voice(prompt, fallback=static_msg)
+                    await tg_send(result + f"\n\n<i>{FOOT}</i>" if "<i>" not in result else result)
+
                 if cmd == "/now":
-                    await tg_send(build_now())
+                    await ai_send(build_now(), "This is the live desk snapshot — cover price, tape direction, key levels, and any open trade. Max 8 sentences.")
+
                 elif cmd == "/flow":
-                    await tg_send(build_flow_report())
+                    await ai_send(build_flow_report(), "Quick tape read — what's the market doing right now, what levels matter. Max 5 sentences.")
+
                 elif cmd == "/weekend":
-                    await tg_send(build_weekend_review())
+                    await ai_send(build_weekend_review(), "Weekly recap — where did everything close, how was the week, what to expect next week. End with motivation. Max 6 sentences.")
+
                 elif cmd == "/smc":
                     for st in STORES:
                         if st.name == "GOLD" and not gold_market_open():
                             continue
-                        await tg_send(SMC_ENGINE.format(st))
+                        smc_static = SMC_ENGINE.format(st)
+                        await ai_send(smc_static, f"This is the Smart Money Concepts read for {st.name}. Explain it like a trader walking someone through the chart — where is price, what zones matter, what's the bias and why. Max 6 sentences.")
+
                 elif cmd == "/dayoutlook":
-                    await tg_send(build_daily_outlook(STORES, PROXIES, H4))
+                    await ai_send(build_daily_outlook(STORES, PROXIES, H4), "Morning outlook — bias, key levels, two scenarios (if it holds X / if it breaks Y), end with a reminder. Max 6 sentences.")
+
                 elif cmd == "/signal":
-                    png = render_chart_bytes(next(s for s in STORES if s.name == "BITCOIN"))
                     card = build_signal_card()
+                    png = render_chart_bytes(next((s for s in STORES if s.name == "BITCOIN"), STORES[0]))
+                    if GEMINI_KEY or GROQ_KEY:
+                        import re
+                        clean = re.sub(r'<[^>]+>', '', card).strip()
+                        prompt = (
+                            f"Signal desk data:\n{clean}\n\n"
+                            "Write this as a trader updating the group on the current trade status. "
+                            "If there's an open trade, tell them entry, stop, targets, and what to do now. "
+                            "If no open trade, tell them we're waiting. Max 4 sentences."
+                        )
+                        card = await ai_voice(prompt, fallback=card)
                     if png and SIGNAL_ENGINE.active:
-                        await tg_photo(png, card)
+                        await tg_photo(png, card + f"\n\n<i>{FOOT}</i>")
                     else:
-                        await tg_send(card)
+                        await tg_send(card + (f"\n\n<i>{FOOT}</i>" if "<i>" not in card else ""))
+
                 elif cmd == "/health":
-                    await tg_send(build_health())
+                    await tg_send(build_health())  # health stays technical/data format
+
                 elif cmd == "/sotd":
-                    await tg_send(build_signal_of_the_day(STORES, PROXIES, H4))
+                    await ai_send(build_signal_of_the_day(STORES, PROXIES, H4), "Signal of the day — best setup, direction, why, and remind them to wait for /signal for exact entry. Max 5 sentences.")
+
                 elif cmd in ("/help", "/start"):
                     await tg_send(HELP_TEXT)
         except Exception as e:
