@@ -1293,10 +1293,14 @@ async def context_worker(ctx: dict):
                         log.warning(f"context: binance funding failed for {fsym} ({e}); trying bybit")
                         try:
                             async with HTTP.get(f"{BYBIT_TICKERS}?category=linear&symbol=BTCUSDT") as r2:
+                                ct = r2.headers.get("Content-Type", "")
+                                if r2.status != 200 or "json" not in ct.lower():
+                                    raise RuntimeError(f"bybit returned status={r2.status} ct={ct}")
                                 j = await r2.json()
                             row = (j.get("result", {}).get("list") or [{}])[0]
                             c["funding"] = float(row.get("fundingRate", 0)) * 100
                             c["funding_source"] = "bybit"
+                            log.info(f"context: bybit funding fallback OK — {c['funding']:+.4f}%")
                         except Exception as e2:
                             log.warning(f"context: bybit funding fallback failed ({e2})")
                     try:
@@ -1312,9 +1316,13 @@ async def context_worker(ctx: dict):
                         log.warning(f"context: binance OI failed for {fsym} ({e}); trying bybit")
                         try:
                             async with HTTP.get(f"{BYBIT_TICKERS}?category=linear&symbol=BTCUSDT") as r2:
+                                ct = r2.headers.get("Content-Type", "")
+                                if r2.status != 200 or "json" not in ct.lower():
+                                    raise RuntimeError(f"bybit returned status={r2.status} ct={ct}")
                                 j = await r2.json()
                             row = (j.get("result", {}).get("list") or [{}])[0]
                             c["oi"] = float(row.get("openInterest", 0))
+                            log.info(f"context: bybit OI fallback OK — {c['oi']:,.0f} BTC")
                         except Exception as e2:
                             log.warning(f"context: bybit OI fallback failed ({e2})")
                 try:
@@ -1421,41 +1429,53 @@ IMPACT_EMOJI = {"High": "🔴", "Medium": "🟡", "Low": "⚪", "Holiday": "📅
 MAJOR_CCY    = {"USD","EUR","GBP","JPY","AUD","CAD","CHF","NZD"}   # show all, flag these
 
 async def _fetch_news_events() -> list:
-    """Fetch ForexFactory calendar — tries primary then CDN fallback.
+    """Fetch ForexFactory calendar. Tries with User-Agent header (some blocks are UA-based).
     Returns raw list of all events or empty list on failure."""
-    for url in (FF_CAL, FF_CAL_CDN):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; trading-desk-bot/1.0)"}
+    for url in (FF_CAL,):   # CDN URL removed — it doesn't resolve from cloud hosts
         try:
-            async with HTTP.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            async with HTTP.get(url, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=15)) as r:
                 ctype = r.headers.get("Content-Type", "")
                 if r.status == 429:
-                    log.warning(f"news: 429 from {url}")
-                    continue
+                    log.warning(f"news: 429 from {url} — will retry in 60s")
+                    await asyncio.sleep(60)
+                    # one retry
+                    async with HTTP.get(url, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r2:
+                        ctype = r2.headers.get("Content-Type", "")
+                        if r2.status != 200 or "json" not in ctype.lower():
+                            log.warning(f"news: retry also failed (status={r2.status})")
+                            return []
+                        evs = await r2.json()
+                        log.info(f"news: {len(evs)} events fetched on retry")
+                        return evs if isinstance(evs, list) else []
                 if r.status != 200:
                     log.warning(f"news: HTTP {r.status} from {url}")
-                    continue
+                    return []
                 if "json" not in ctype.lower():
                     body = await r.text()
                     log.warning(f"news: non-JSON from {url} ({ctype}): {body[:120]}")
-                    continue
+                    return []
                 evs = await r.json()
-                log.info(f"news: {len(evs)} raw events from {url}")
+                log.info(f"news: {len(evs)} raw events fetched")
                 return evs if isinstance(evs, list) else []
         except Exception as e:
-            log.warning(f"news: error fetching {url}: {e}")
+            log.warning(f"news: fetch error from {url}: {e}")
     return []
 
 async def news_worker():
-    # fetch immediately on startup, then every 30 min
+    # wait 30s on startup to let the HTTP session settle
+    await asyncio.sleep(30)
     while True:
         evs = await _fetch_news_events()
         if evs:
-            # keep everything — user sees all events, blackout only blocks High
-            # FF JSON uses 'country' (not 'currency') for the currency field
-            NEWS["events"] = [e for e in evs if e.get("country") in MAJOR_CCY
+            NEWS["events"] = [e for e in evs
+                              if e.get("country") in MAJOR_CCY
                               or e.get("impact") == "High"]
             high = sum(1 for e in NEWS["events"] if e.get("impact") == "High")
-            log.info(f"news: stored {len(NEWS['events'])} events this week "
-                     f"({high} high-impact) from {len(evs)} total")
+            log.info(f"news: stored {len(NEWS['events'])} events ({high} high-impact) "
+                     f"from {len(evs)} total")
             if not NEWS["events"]:
                 log.warning(f"news: zero stored — sample raw keys: "
                             f"{list(evs[0].keys()) if evs else 'empty'}")
@@ -1738,27 +1758,71 @@ def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
 
 def build_daily_outlook(stores, proxies, h4) -> str:
     t = now_eat()
-    lines = [f"🌅 <b>DAILY OUTLOOK · {t.strftime('%a %d %b').upper()}</b>\n"]
+    day = t.strftime("%A %d %B")
+    openers = [
+        f"Morning traders. Let's see what we're working with today — {day}.",
+        f"Good morning. Here's the desk read for {day}.",
+        f"Morning. {day} — here's where everything stands before we start looking for setups.",
+        f"Rise and grind. {day} — full market read below.",
+    ]
+    lines = [random.choice(openers) + "\n"]
+
     for st in stores:
         n = st.name
         if n == "GOLD" and not gold_market_open():
+            lines.append(f"Gold market is closed today — no setups there.\n")
             continue
         intra, wk = structure_read(st, h4)
         fs = st if st.cvd_ticks else proxies.get(n, st)
         fm = flow_metrics(fs)
         fl = fm["dir"] if fm else "NEUTRAL"
-        _, grade = agreement_full(intra, wk, fl)
-        price_str = fp(st.price, n) if st.price else "—"
         vw = st.vwap()
-        vwap_str = f" · VWAP {fp(vw, n)}" if vw else ""
-        dir_str = DIR_WORD[fl] if fl != "NEUTRAL" else "Neutral"
-        conv_str = f" · {fm['conv'].lower()} conv" if fm and fl != "NEUTRAL" else ""
-        lines.append(f"<b>{n}</b>  {price_str}  ·  {dir_str} {grade}{conv_str}{vwap_str}")
-    news = news_today_lines()
-    if news.strip():
-        lines.append(f"\n{news.strip()}")
+        p = st.price
+        price_str = fp(p, n) if p else "—"
+        vwap_str = fp(vw, n) if vw else None
+        smc = SMC_ENGINE.analyse(st)
+        bull_ob = smc.get("bull_ob")
+        bear_ob = smc.get("bear_ob")
+        liq = smc.get("liq", [])
+
+        if fl == "BULL" and intra in ("BULL", "NEUTRAL"):
+            buy_zone = fp(bull_ob["low"], n) if bull_ob else vwap_str
+            supply = fp(bear_ob["high"], n) if bear_ob else None
+            liq_note = f" Liquidity up at {fp(liq[0]['level'], n)}." if liq and liq[0]["distance_pct"] > 0 else ""
+            if supply:
+                bull_line = f"If price holds above {vwap_str or price_str} and pushes through {supply}, we're looking for longs towards the next liquidity pool.{liq_note} If it drops back below {buy_zone or vwap_str}, stand aside until it finds support."
+            else:
+                bull_line = f"Tape is bullish — we want to see it hold above {vwap_str or price_str} for long setups.{liq_note} If it breaks down through VWAP, we step back and wait."
+            lines.append(f"{n} sitting at {price_str}. Bias is LONG.\n{bull_line}\n")
+
+        elif fl == "BEAR" and intra in ("BEAR", "NEUTRAL"):
+            sell_zone = fp(bear_ob["high"], n) if bear_ob else vwap_str
+            demand = fp(bull_ob["low"], n) if bull_ob else None
+            liq_note = f" Liquidity below at {fp(liq[0]['level'], n)}." if liq and liq[0]["distance_pct"] < 0 else ""
+            if demand:
+                bear_line = f"We're watching {sell_zone or vwap_str} as resistance — if it rejects there we look for sells down to {demand}.{liq_note} If it breaks above {sell_zone or vwap_str} cleanly, the bias flips."
+            else:
+                bear_line = f"Tape is bearish — shorts are in control below {vwap_str or price_str}.{liq_note} If price reclaims VWAP, no new sells until we reassess."
+            lines.append(f"{n} sitting at {price_str}. Bias is SHORT.\n{bear_line}\n")
+
+        else:
+            lines.append(f"{n} at {price_str} — tape is mixed right now, no clean edge yet. We wait for one side to commit before calling a direction.\n")
+
+    today_events = [e.get("title") for e in NEWS.get("events", [])
+                    if e.get("impact") == "High"
+                    and _event_today(e)]
+    if today_events:
+        lines.append(f"⚠️ High-impact news today: {', '.join(today_events)}. Signals pause 15 min before each release — plan around it.\n")
+
+    lines.append("REMEMBER — we only trade setups, we don't chase price. If there's no setup, there's NO TRADE ‼️")
     lines.append(f"\n🎯 {SIGNAL_ENGINE.record_line()}")
     return "\n".join(lines) + footer()
+
+def _event_today(e) -> bool:
+    try:
+        return _event_dt(e).astimezone(EAT).date() == datetime.now(EAT).date()
+    except Exception:
+        return False
 
 def confluence_score(st: CandleStore, proxies: dict, h4: dict) -> dict:
     """Original confluence scorer for 'Signal of the Day'. Combines structure alignment
