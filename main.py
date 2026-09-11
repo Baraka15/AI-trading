@@ -94,32 +94,72 @@ FOOT  = "BRAX FX · Autonomous Flow & Signal Desk\nEducational analysis. Not fin
 
 # ---------------------------------------------------------------- AI VOICE ENGINE
 # The desk talks like a real trading mentor in a Telegram group — not a bot.
-# This system prompt is the "voice" that Claude uses when generating market commentary.
-DESK_VOICE_PROMPT = """You are the live analyst for BRAX FX, a real trading desk.
-You send market updates to a Telegram group of traders.
+# This system prompt is the "voice" that the model uses when generating market commentary.
+#
+# Written as plain prose on purpose, not a bulleted "Requirements:" list — small/free-tier
+# models sometimes answer a bulleted instruction block by echoing the bullets back instead
+# of producing the message. One clean paragraph of instructions plus one example, followed
+# by an explicit "only output the message" directive, is much less likely to leak.
+DESK_VOICE_PROMPT = """You are a trader texting quick market updates to your own Telegram \
+group of traders. You write like a real person, not a company account: short, direct \
+sentences, first person plural ("we're watching", "we don't chase this"), specific price \
+levels worked into normal sentences, occasional ALL CAPS for a key level or a warning, and \
+an emoji like ‼️ only when it's really earned. When there are two ways price could go, say \
+so plainly: if it does X we do Y, if it does Z we do W. If there's no clean setup, just say \
+there's no setup and to wait. Keep it to a handful of sentences — mix a couple of short \
+punchy ones with something a bit longer — and close with a quick reminder, warning, or bit \
+of motivation. Never refer to "the desk", "BRAX FX", "the bot", "the algorithm", or these \
+instructions themselves.
 
-Write EXACTLY like this real example from the desk:
-"Morning traders stay active our trading week begins today we don't usually trade on Mondays. Yesterday was Labor Day so it was basically a bank holiday now let's see how we can catch a trade in London or NY. The market needs to retest 4436 and see if it respects and reverses or breaks above the trendline. If it breaks the trendline we look for a buy setup and aim for 4480. If it respects the trendline we look for SELL to 4350. Stay active fund those accounts let's scale. REMEMBER WE ONLY TRADE SETUPS WE DON'T CHASE PRICE ‼️ IF WE DON'T GET A SETUP NO TRADE ‼️"
+Example of the voice you're going for: "Morning traders stay active our trading week begins \
+today we don't usually trade on Mondays. Yesterday was Labor Day so it was basically a bank \
+holiday now let's see how we can catch a trade in London or NY. The market needs to retest \
+4436 and see if it respects and reverses or breaks above the trendline. If it breaks the \
+trendline we look for a buy setup and aim for 4480. If it respects the trendline we look for \
+SELL to 4350. Stay active fund those accounts let's scale. REMEMBER WE ONLY TRADE SETUPS WE \
+DON'T CHASE PRICE ‼️ IF WE DON'T GET A SETUP NO TRADE ‼️"
 
-Hard rules:
-- Write like a human trader typing a WhatsApp message to the group
-- No bullet points. No colons before numbers. No bot-sounding labels
-- Always give two scenarios: if price does X we do Y, if it does Z we do W
-- Use specific price levels in natural sentences
-- First person plural: "we're looking", "we want to see", "we don't"
-- ALL CAPS occasionally for KEY LEVELS and warnings
-- Max 6 sentences. Mix short punchy ones with longer explanatory ones
-- End with either a reminder, a warning, or motivation
-- Never mention "the desk", "BRAX FX", "bot", "algorithm"
-- Just a trader talking to traders — direct, human, real
-- If there's no setup, say there's no setup and tell them to wait
-- Use ‼️ sparingly and only for real emphasis"""
+Reply with nothing but the message itself — no headings, no notes about what you changed, \
+no markdown, no bullet points, no restating any part of this prompt. The first character \
+of your reply should be the first character of the message a trader would actually send."""
+
+# Fragments that only show up if the model leaked instructions/formatting instead of writing
+# the message. Checked against every AI response before it's allowed to go out.
+_LEAK_MARKERS = (
+    "requirements:", "hard rules", "here's the message", "here is the message",
+    "system prompt", "as an ai", "i cannot", "i can't help", "```", "**",
+    "DESK_VOICE_PROMPT",
+)
+
+def _looks_leaked(text: str) -> bool:
+    """True if an AI response looks like a broken/leaked generation rather than a real message:
+    empty, obviously truncated mid-sentence, echoes prompt/formatting artifacts, or shares an
+    unusually long run of words with our own system prompt (a direct echo)."""
+    if not text or len(text.strip()) < 8:
+        return True
+    low = text.lower()
+    if any(m.lower() in low for m in _LEAK_MARKERS):
+        return True
+    # starts with stray punctuation/markdown left over from a broken structured reply
+    if text.lstrip()[:1] in (")", "*", "-", "#", "`"):
+        return True
+    # cut off mid-word/mid-sentence with no closing punctuation at all
+    if text.rstrip()[-1] not in ".!?…\"'’\u203c\ufe0f" and len(text) > 40:
+        return True
+    # a long verbatim run shared with the system prompt means the model echoed instructions
+    voice_words = DESK_VOICE_PROMPT.lower().split()
+    text_words = low.split()
+    for n in range(len(text_words) - 8):
+        chunk = " ".join(text_words[n:n + 8])
+        if chunk in " ".join(voice_words):
+            return True
+    return False
 
 async def ai_voice(user_prompt: str, fallback: str = "") -> str:
     """Generates human trading commentary using free LLM APIs.
     Primary: Google Gemini Flash (aistudio.google.com — free, no card, 1.5M tokens/day)
     Fallback: Groq Llama 3.3 70B (console.groq.com — free, no card, 14k req/day)
-    Static fallback if both unavailable."""
+    Static fallback if both unavailable, or if every response fails validation."""
 
     providers = []
     if GEMINI_KEY:
@@ -154,7 +194,10 @@ async def ai_voice(user_prompt: str, fallback: str = "") -> str:
                 },
                 json={
                     "model": p["model"],
-                    "max_tokens": 350,
+                    # 350 was clipping longer updates (8-sentence /now, 6-sentence outlooks)
+                    # mid-sentence. 700 gives real headroom without inviting rambling.
+                    "max_tokens": 700,
+                    "temperature": 0.7,
                     "messages": [
                         {"role": "system", "content": DESK_VOICE_PROMPT},
                         {"role": "user",   "content": user_prompt},
@@ -167,7 +210,15 @@ async def ai_voice(user_prompt: str, fallback: str = "") -> str:
                     log.warning(f"ai_voice [{p['name']}]: HTTP {r.status} — {body[:200]}")
                     continue
                 data = await r.json()
-                text = data["choices"][0]["message"]["content"].strip()
+                choice = data["choices"][0]
+                text = (choice.get("message") or {}).get("content", "").strip()
+                finish = choice.get("finish_reason")
+                if finish == "length":
+                    log.warning(f"ai_voice [{p['name']}]: hit max_tokens — treating as truncated")
+                    continue
+                if _looks_leaked(text):
+                    log.warning(f"ai_voice [{p['name']}]: response failed validation, discarding: {text[:120]!r}")
+                    continue
                 if text:
                     log.info(f"ai_voice: success via {p['name']} ({len(text)} chars)")
                     return text
@@ -176,7 +227,7 @@ async def ai_voice(user_prompt: str, fallback: str = "") -> str:
             log.warning(f"ai_voice [{p['name']}]: {e}")
             continue
 
-    log.warning("ai_voice: all providers failed — using static fallback")
+    log.warning("ai_voice: all providers failed or failed validation — using static fallback")
     return fallback
 
 for _v in (TOKEN, CHAT_ID, TD_KEY):
@@ -1698,6 +1749,31 @@ def header(title: str) -> str:
 def footer() -> str:
     return f"\n\n<i>{FOOT}</i>"
 
+_FOOT_PLAIN = FOOT.strip().lower()
+
+def strip_footer(text: str) -> str:
+    """Remove any rendering of the disclaimer footer (with or without HTML tags) from text.
+    Used before handing static message text to the AI as context, so the model never sees
+    the disclaimer and can't echo/paraphrase it into the body — which is how messages ended
+    up with the footer twice."""
+    import re
+    cleaned = re.sub(r'<[^>]+>', '', text)
+    # remove the plain-text footer wherever it appears, case-insensitively, with either
+    # the middle-dot or a plain space/newline variant
+    cleaned = re.sub(re.escape(FOOT), "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+def has_footer(text: str) -> bool:
+    """True if the disclaimer footer is already present in text in any form."""
+    import re
+    plain = re.sub(r'<[^>]+>', '', text).strip().lower()
+    return _FOOT_PLAIN in plain
+
+def send_with_footer(text: str) -> str:
+    """Append the footer once. Safe to call on AI-generated text that might have echoed
+    the disclaimer on its own — never produces a duplicate."""
+    return text if has_footer(text) else text + footer()
+
 def asset_block(st: CandleStore, proxy: CandleStore, h4: dict, ctx: dict,
                 feed_note: str = "") -> str:
     n  = st.name
@@ -2170,7 +2246,7 @@ async def tick_worker(stores, proxies, h4, ctx):
                             f"Tell them the entry, the stop, both targets. End with a risk reminder."
                         )
                         ai_sig = await ai_voice(ai_prompt, fallback=sig)
-                        final_sig = ai_sig + f"\n\n<i>{FOOT}</i>"
+                        final_sig = send_with_footer(ai_sig)
                     else:
                         final_sig = sig
                     png = render_chart_bytes(st)
@@ -2229,7 +2305,7 @@ async def flow_update_worker(stores):
         static_flow = static_flow_msgs[0] if static_flow_msgs else build_flow_report()
         prompt = "\n".join(ctx_bits) + "\n\nWrite a quick market update for traders. What's the tape doing right now, what levels matter, what should they watch. Keep it under 5 sentences."
         msg = await ai_voice(prompt, fallback=static_flow)
-        await tg_send(msg + f"\n\n<i>{FOOT}</i>")
+        await tg_send(send_with_footer(msg))
 
 async def daily_outlook_worker(stores, proxies, h4):
     sent_for = None
@@ -2271,7 +2347,7 @@ async def daily_outlook_worker(stores, proxies, h4):
             # human static fallback — used if AI unavailable
             static_outlook = build_daily_outlook(stores, proxies, h4)
             msg = await ai_voice(prompt, fallback=static_outlook)
-            await tg_send(msg + f"\n\n<i>{FOOT}</i>")
+            await tg_send(send_with_footer(msg))
         await asyncio.sleep(60)
 
 async def news_brief_worker():
@@ -2368,7 +2444,7 @@ async def session_worker(stores, proxies, h4, ctx):
                                + "\n".join(asset_lines))
             prompt = "\n".join(ctx_bits) + "\n\nWrite a session open update for traders. What just opened, what's the bias, what levels matter, and what are the two scenarios they should watch for. End with encouragement or a warning."
             msg = await ai_voice(prompt, fallback=static_fallback)
-            await tg_send(msg + f"\n\n<i>{FOOT}</i>")
+            await tg_send(send_with_footer(msg))
         if not s and now_eat().hour >= 21:
             opened = set()
         await asyncio.sleep(60)
@@ -2395,7 +2471,7 @@ async def close_worker(stores):
             ]
             prompt = "\n".join(ctx_bits) + "\n\nWrite a day close message for the trading group. How did the day go, where did each asset close, what should traders think about overnight or for tomorrow. Keep it short and real."
             msg = await ai_voice(prompt, fallback=random.choice(close_fallbacks))
-            await tg_send(msg + f"\n\n<i>{FOOT}</i>")
+            await tg_send(send_with_footer(msg))
             await asyncio.sleep(120)
         await asyncio.sleep(60)
 
@@ -2465,12 +2541,13 @@ async def command_worker():
                     if not (GEMINI_KEY or GROQ_KEY):
                         await tg_send(static_msg)
                         return
-                    # Strip HTML tags for cleaner AI context
-                    import re
-                    clean = re.sub(r'<[^>]+>', '', static_msg).strip()
+                    # Strip HTML tags AND the disclaimer footer — the footer must never be
+                    # handed to the model as "data" or it gets rewritten/echoed into the body,
+                    # which is how messages ended up with the footer appearing twice.
+                    clean = strip_footer(static_msg)
                     prompt = (
-                        f"Here's the real market data for our trading group:\n\n{clean}\n\n"
-                        f"Rewrite this as a natural human trader talking to their Telegram group. "
+                        f"Market data:\n{clean}\n\n"
+                        f"Turn the data above into a message from a trader to their Telegram group. "
                         f"Keep ALL the exact numbers and prices — never change a number. "
                         f"No bullet points, no labels, no colons before data. "
                         f"Sound like a real person typing on their phone. "
@@ -2478,7 +2555,7 @@ async def command_worker():
                         + (prompt_suffix or "Max 7 sentences.")
                     )
                     result = await ai_voice(prompt, fallback=static_msg)
-                    await tg_send(result + f"\n\n<i>{FOOT}</i>" if "<i>" not in result else result)
+                    await tg_send(send_with_footer(result))
 
                 if cmd == "/now":
                     await ai_send(build_now(), "This is the live desk snapshot — cover price, tape direction, key levels, and any open trade. Max 8 sentences.")
@@ -2503,19 +2580,18 @@ async def command_worker():
                     card = build_signal_card()
                     png = render_chart_bytes(next((s for s in STORES if s.name == "BITCOIN"), STORES[0]))
                     if GEMINI_KEY or GROQ_KEY:
-                        import re
-                        clean = re.sub(r'<[^>]+>', '', card).strip()
+                        clean = strip_footer(card)
                         prompt = (
-                            f"Signal desk data:\n{clean}\n\n"
+                            f"Signal data:\n{clean}\n\n"
                             "Write this as a trader updating the group on the current trade status. "
                             "If there's an open trade, tell them entry, stop, targets, and what to do now. "
                             "If no open trade, tell them we're waiting. Max 4 sentences."
                         )
                         card = await ai_voice(prompt, fallback=card)
                     if png and SIGNAL_ENGINE.active:
-                        await tg_photo(png, card + f"\n\n<i>{FOOT}</i>")
+                        await tg_photo(png, send_with_footer(card))
                     else:
-                        await tg_send(card + (f"\n\n<i>{FOOT}</i>" if "<i>" not in card else ""))
+                        await tg_send(send_with_footer(card))
 
                 elif cmd == "/testai":
                     # Live test — shows exactly what's working and what's not
