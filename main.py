@@ -6,7 +6,8 @@ Assets: BITCOIN (24/7 live tape) · GOLD (spot-hours aware; flow via PAXG tape)
 AUTO POSTS (fully autonomous)
   • DAILY OUTLOOK     — 07:00 EAT daily: prose narrative + sessions + news
   • SESSION OPEN      — Asia 02:00 / London 08:00 / NY 13:00 / NY PM 17:00 EAT
-  • FLOW UPDATE       — hourly in-session
+  • FLOW UPDATE       — every 15-20 min in-session, BTC and GOLD sent as separate
+                        messages, each with its own live chart
   • REAL-TIME ALERTS  — flow flip · absorption · liquidity sweep · VWAP cross
   • MANIPULATION      — stop hunts · fake breakouts · squeeze traps · absorption
   • A+ SIGNALS        — >=10/12 confluence, ATR SL/TP, chart attached, tracked to outcome
@@ -93,35 +94,32 @@ BRAND = "BRAX FX // FLOW & SIGNAL DESK"
 FOOT  = "BRAX FX · Autonomous Flow & Signal Desk\nEducational analysis. Not financial advice. Trading carries risk."
 
 # ---------------------------------------------------------------- AI VOICE ENGINE
-# The desk talks like a real trading mentor in a Telegram group — not a bot.
-# This system prompt is the "voice" that the model uses when generating market commentary.
-#
-# Written as plain prose on purpose, not a bulleted "Requirements:" list — small/free-tier
-# models sometimes answer a bulleted instruction block by echoing the bullets back instead
-# of producing the message. One clean paragraph of instructions plus one example, followed
-# by an explicit "only output the message" directive, is much less likely to leak.
-DESK_VOICE_PROMPT = """You are a trader texting quick market updates to your own Telegram \
-group of traders. You write like a real person, not a company account: short, direct \
-sentences, first person plural ("we're watching", "we don't chase this"), specific price \
-levels worked into normal sentences, occasional ALL CAPS for a key level or a warning, and \
-an emoji like ‼️ only when it's really earned. When there are two ways price could go, say \
-so plainly: if it does X we do Y, if it does Z we do W. If there's no clean setup, just say \
-there's no setup and to wait. Keep it to a handful of sentences — mix a couple of short \
-punchy ones with something a bit longer — and close with a quick reminder, warning, or bit \
-of motivation. Never refer to "the desk", "BRAX FX", "the bot", "the algorithm", or these \
-instructions themselves.
+# Formal, direct, educational market commentary — a professional analyst's voice, not
+# a hype trader and not a bot reciting numbers. Written as plain prose on purpose, not a
+# bulleted "Requirements:" list — small/free-tier models sometimes answer a bulleted
+# instruction block by echoing the bullets back instead of producing the message. One
+# clean paragraph plus one example, followed by an explicit "only output the message"
+# directive, is much less likely to leak.
+DESK_VOICE_PROMPT = """You write short, formal market updates for traders — direct \
+analysis, not hype. Plain, professional sentences: state where price is, what the order \
+flow is doing, which level matters next, and briefly why it matters, so the reader learns \
+something rather than just being handed a number. When there are two ways price could go, \
+lay out both plainly: if it holds X, then Y; if it breaks Z, then W. If there's no clean \
+setup, say so and say to wait — don't invent one. Use the figures exactly as given, worked \
+into normal sentences, not bullet points, no ALL CAPS, no emoji spam, no filler like "let's \
+scale" or "fund those accounts." A handful of sentences is enough. Don't use internal \
+labels like "the desk" or a brand name — write as the analysis itself, not an announcement \
+about who's speaking.
 
-Example of the voice you're going for: "Morning traders stay active our trading week begins \
-today we don't usually trade on Mondays. Yesterday was Labor Day so it was basically a bank \
-holiday now let's see how we can catch a trade in London or NY. The market needs to retest \
-4436 and see if it respects and reverses or breaks above the trendline. If it breaks the \
-trendline we look for a buy setup and aim for 4480. If it respects the trendline we look for \
-SELL to 4350. Stay active fund those accounts let's scale. REMEMBER WE ONLY TRADE SETUPS WE \
-DON'T CHASE PRICE ‼️ IF WE DON'T GET A SETUP NO TRADE ‼️"
+Example of the register: "Gold is testing 4436 after reclaiming the range high, and that \
+level is the one to watch because it capped the last two pushes higher. If it holds above \
+4436 into London, the setup favors a continuation toward 4480. If it's rejected and closes \
+back under 4436, the more likely path is a retest of 4350. No position until one of those \
+confirms — reacting to the first touch of a level is how stops get run."
 
-Reply with nothing but the message itself — no headings, no notes about what you changed, \
+Reply with nothing but the message itself — no headings, no notes about what changed, \
 no markdown, no bullet points, no restating any part of this prompt. The first character \
-of your reply should be the first character of the message a trader would actually send."""
+of your reply should be the first character of the message a trader would actually read."""
 
 # Fragments that only show up if the model leaked instructions/formatting instead of writing
 # the message. Checked against every AI response before it's allowed to go out.
@@ -1146,17 +1144,65 @@ def render_chart(st: CandleStore, out_path: str):
     ax1.vlines(x, df.l, df.h, color=np.where(up, "#26a69a", "#ef5350"), lw=0.8)
     ax1.bar(x, (df.c - df.o), 0.6, bottom=df.o,
             color=np.where(up, "#26a69a", "#ef5350"))
+
     vw = st.vwap()
     if vw:
         ax1.axhline(vw, ls="--", c="#f0b90b", lw=1, label="Session VWAP")
+
+    # Support/resistance zone — nearest untested order block from the real SMC read,
+    # not a drawn guess. Shaded the same way a manual TA screenshot would mark it.
+    smc = SMC_ENGINE.analyse(st) or {}
+    zone = None
+    for ob in (smc.get("bull_ob"), smc.get("bear_ob")):
+        if ob and st.price and (zone is None or
+                abs(st.price - (ob["low"] + ob["high"]) / 2) <
+                abs(st.price - (zone["low"] + zone["high"]) / 2)):
+            zone = ob
+    if zone:
+        ax1.axhspan(zone["low"], zone["high"], color="#787b86", alpha=0.18, label="Key zone")
+
+    # Trend guide — linear fit through recent highs. Labeled as a fit, not asserted as a
+    # hand-drawn trendline, since that's what it actually is.
+    n_fit = min(40, len(df))
+    if n_fit >= 8:
+        xs = x[-n_fit:]
+        hs = df.h.values[-n_fit:]
+        m, b = np.polyfit(xs, hs, 1)
+        ax1.plot([xs[0], x[-1] + 8], [m * xs[0] + b, m * (x[-1] + 8) + b],
+                 ls="-", lw=0.9, c="#787b86", alpha=0.8, label="Trend (fit)")
+
     sig = SIGNAL_ENGINE.active.get(st.name)
     if sig:
-        for lvl, lbl in ((sig["entry"], "Entry"), (sig["sl"], "SL"),
-                         (sig["tp1"], "TP1"), (sig["tp2"], "TP2")):
-            ax1.axhline(lvl, ls=":", lw=1)
-            ax1.annotate(lbl, (0, lvl), fontsize=7, va="bottom")
-    ax1.set_title(f"{st.name} 15m — {fp(st.price, st.name)}", fontsize=11)
-    ax1.legend(fontsize=7)
+        for lvl, lbl, col in ((sig["entry"], "Entry", "#42a5f5"),
+                               (sig["sl"], "SL", "#ef5350"),
+                               (sig["tp1"], "TP1", "#26a69a"),
+                               (sig["tp2"], "TP2", "#26a69a")):
+            ax1.axhline(lvl, ls=":", lw=1, c=col)
+            ax1.annotate(lbl, (0, lvl), fontsize=7, va="bottom", color=col)
+        # floating distance-from-entry tag in real price units — "pts" rather than "pips"
+        # since pip size for gold varies by broker and crypto isn't quoted in pips at all;
+        # a plain price delta is accurate for both without assuming a convention we don't know.
+        if st.price:
+            diff = st.price - sig["entry"]
+            dir_sign = 1 if sig["dir"] == "BULL" else -1
+            dist_txt = f"{diff:+,.0f} pts" if "BTC" in st.name or "BITCOIN" in st.name else f"{diff:+,.2f} pts"
+            ax1.annotate(dist_txt, (x[-1], st.price), fontsize=8, fontweight="bold",
+                        color=("#26a69a" if diff * dir_sign >= 0 else "#ef5350"),
+                        xytext=(34, 12), textcoords="offset points", va="center",
+                        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#787b86", lw=0.6))
+
+    # floating live-price tag on the right edge, same idea as a platform's last-price marker
+    if st.price:
+        ax1.annotate(fp(st.price, st.name), (x[-1], st.price), fontsize=8,
+                    fontweight="bold", color="white",
+                    xytext=(34, -12) if sig else (8, 0), textcoords="offset points",
+                    va="center",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="#2962ff", ec="none"))
+
+    ax1.set_title(f"{st.name} 15m — {fp(st.price, st.name)} · {now_eat().strftime('%d %b %H:%M EAT')}", fontsize=11)
+    ax1.legend(fontsize=7, loc="upper left")
+    ax1.set_xlim(x[0], x[-1] + 10)   # legroom so the floating tags don't clip off-canvas
+
     cum = np.cumsum([s for _, s, _ in st.cvd_ticks])[-len(df):] if st.cvd_ticks else x * 0
     ax2.fill_between(x, cum, color="#42a5f5", alpha=0.4)
     ax2.set_title("Tick CVD (session)", fontsize=8)
@@ -2262,15 +2308,18 @@ async def tick_worker(stores, proxies, h4, ctx):
             log.exception("tick")
         await asyncio.sleep(TICK_INTERVAL)
 
+FLOW_INTERVAL_SEC = (15 * 60, 20 * 60)   # random 15-20 min between flow updates
+
 async def flow_update_worker(stores):
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(random.randint(*FLOW_INTERVAL_SEC))
         s = session_name()
         if not s or now_eat().hour not in FLOW_HOURS:
             continue
         t_str = now_eat().strftime("%H:%M EAT")
-        ctx_bits = [f"Time: {t_str}, Session: {s}"]
         for st in stores:
+            if st.name == "GOLD" and not gold_market_open():
+                continue
             fs = st if st.cvd_ticks else PROXIES.get(st.name, st)
             fm = flow_metrics(fs)
             c = CTX.get(st.name, {})
@@ -2280,32 +2329,42 @@ async def flow_update_worker(stores):
             smc = SMC_ENGINE.analyse(st)
             liq = smc.get("liq", [])
             p = st.price
-            ctx_bits.append(
-                f"\n{st.name}: {fp(p, st.name) if p else '—'}, "
+
+            # one asset's data only — this is what keeps BTC and GOLD as two separate,
+            # independent messages instead of one combined update
+            ctx_bits = [
+                f"Time: {t_str}, Session: {s}",
+                f"{st.name}: {fp(p, st.name) if p else '—'}, "
                 f"tape {'bullish' if fm and fm['dir']=='BULL' else 'bearish' if fm and fm['dir']=='BEAR' else 'mixed'}, "
                 f"conviction {'high' if fm and fm['conv']=='High' else 'medium' if fm and fm['conv']=='Medium' else 'low'}, "
                 f"CVD 15m {fm['c15']:+,.0f} 1h {fm['c1h']:+,.0f}, "
                 f"flow {'accelerating' if 'accel' in acc else 'fading' if 'fading' in acc else 'steady'}, "
-                f"VWAP {fp(vw, st.name) if vw else 'none'}"
-            )
+                f"VWAP {fp(vw, st.name) if vw else 'none'}",
+            ]
             if bid_w and ask_w:
                 ctx_bits.append(f"Key levels: bid wall ${bid_w['usd']//1000}k at {fp(bid_w['price'], st.name)}, ask wall ${ask_w['usd']//1000}k at {fp(ask_w['price'], st.name)}")
             if liq:
                 ctx_bits.append("Liquidity pools nearby: " + ", ".join(f"{fp(l['level'], st.name)} ({l['type']})" for l in liq[:2]))
-        liq_1h = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 3600)
-        if liq_1h > 1_000_000:
-            ctx_bits.append(f"BTC liquidations last hour: ${liq_1h/1e6:.1f}M forced out")
-        # human static fallback for flow update
-        static_flow_msgs = [
-            f"Quick tape check — {t_str}. " + " ".join(
-                f"{st.name} {'bullish' if (fm:=flow_metrics(st if st.cvd_ticks else PROXIES.get(st.name,st))) and fm['dir']=='BULL' else 'bearish' if fm and fm['dir']=='BEAR' else 'mixed'} at {fp(st.price, st.name) if st.price else '—'}."
-                for st in stores if not (st.name == 'GOLD' and not gold_market_open())
-            ),
-        ]
-        static_flow = static_flow_msgs[0] if static_flow_msgs else build_flow_report()
-        prompt = "\n".join(ctx_bits) + "\n\nWrite a quick market update for traders. What's the tape doing right now, what levels matter, what should they watch. Keep it under 5 sentences."
-        msg = await ai_voice(prompt, fallback=static_flow)
-        await tg_send(send_with_footer(msg))
+            if st.name == "BITCOIN":
+                liq_1h = sum(x[5] for x in LIQUIDATIONS if x[0] >= time.time() - 3600)
+                if liq_1h > 1_000_000:
+                    ctx_bits.append(f"Liquidations last hour: ${liq_1h/1e6:.1f}M forced out")
+
+            dir_word = "Bullish" if fm and fm["dir"] == "BULL" else "Bearish" if fm and fm["dir"] == "BEAR" else "Mixed"
+            static_flow = f"{st.name} — {t_str}. {dir_word} tape at {fp(p, st.name) if p else '—'}."
+            prompt = "\n".join(ctx_bits) + (
+                "\n\nWrite a short, formal update on this one asset only — do not mention "
+                "the other asset. State where price is, what the order flow is doing, and "
+                "the single nearest level that matters, with a brief line on why that level "
+                "matters. Direct, professional register, no hype, no slang. 3-4 sentences."
+            )
+            msg = await ai_voice(prompt, fallback=static_flow)
+            png = render_chart_bytes(st)
+            if png:
+                await tg_photo(png, send_with_footer(msg))
+            else:
+                await tg_send(send_with_footer(msg))
+            await asyncio.sleep(4)   # stagger so BTC and GOLD arrive as two distinct messages
 
 async def daily_outlook_worker(stores, proxies, h4):
     sent_for = None
