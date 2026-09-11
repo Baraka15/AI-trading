@@ -123,18 +123,20 @@ async def ai_voice(user_prompt: str, fallback: str = "") -> str:
 
     providers = []
     if GEMINI_KEY:
-        providers.append({
-            "url":   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            "key":   GEMINI_KEY,
-            "model": "gemini-2.0-flash",
-            "name":  "gemini",
-        })
+        # gemini-2.0-flash was shut down June 1 2026 — use current models
+        for model in ("gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash"):
+            providers.append({
+                "url":   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                "key":   GEMINI_KEY,
+                "model": model,
+                "name":  f"gemini/{model}",
+            })
     if GROQ_KEY:
         providers.append({
             "url":   "https://api.groq.com/openai/v1/chat/completions",
             "key":   GROQ_KEY,
             "model": "llama-3.3-70b-versatile",
-            "name":  "groq",
+            "name":  "groq/llama-3.3-70b",
         })
 
     if not providers:
@@ -2069,8 +2071,9 @@ def build_health() -> str:
     lines.append(f"Liqs  5m ${liq_5m/1e3:.0f}k  ·  1h ${liq_1h/1e6:.2f}M")
     nb = "🔴 ACTIVE" if news_blackout() else "clear"
     lines.append(f"Session {session_name() or 'CLOSED'}  ·  News {nb}")
-    sigs = list(SIGNAL_ENGINE.active.keys()) or ["none"]
-    lines.append(f"Open: {', '.join(sigs)}")
+    gem_status = "✅ set" if GEMINI_KEY else "❌ not set (add GEMINI_API_KEY in Render)"
+    grq_status = "✅ set" if GROQ_KEY else "❌ not set (add GROQ_API_KEY in Render)"
+    lines.append(f"AI voice: Gemini {gem_status} · Groq {grq_status}")
     lines.append(f"🎯 {SIGNAL_ENGINE.record_line()}")
     return "\n".join(lines) + footer()
 
@@ -2513,6 +2516,19 @@ async def command_worker():
                         await tg_photo(png, card + f"\n\n<i>{FOOT}</i>")
                     else:
                         await tg_send(card + (f"\n\n<i>{FOOT}</i>" if "<i>" not in card else ""))
+
+                elif cmd == "/testai":
+                    # Live test — shows exactly what's working and what's not
+                    gem = "✅ set" if GEMINI_KEY else "❌ missing"
+                    grq = "✅ set" if GROQ_KEY else "❌ missing"
+                    status_msg = (f"🔧 AI Voice Status\n\nGEMINI_API_KEY: {gem}\nGROQ_API_KEY: {grq}\n\n"
+                                  "Testing Gemini now...")
+                    await tg_send(status_msg)
+                    test_result = await ai_voice(
+                        "Say exactly this in your own words: The AI voice is working. Ready to send human messages.",
+                        fallback="❌ AI voice failed — check Render logs for the exact error."
+                    )
+                    await tg_send(test_result)
 
                 elif cmd == "/health":
                     await tg_send(build_health())  # health stays technical/data format
