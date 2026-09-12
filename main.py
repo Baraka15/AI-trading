@@ -94,28 +94,24 @@ BRAND = "BRAX FX // FLOW & SIGNAL DESK"
 FOOT  = "BRAX FX · Autonomous Flow & Signal Desk\nEducational analysis. Not financial advice. Trading carries risk."
 
 # ---------------------------------------------------------------- AI VOICE ENGINE
-# Formal, direct, educational market commentary — a professional analyst's voice, not
-# a hype trader and not a bot reciting numbers. Written as plain prose on purpose, not a
-# bulleted "Requirements:" list — small/free-tier models sometimes answer a bulleted
-# instruction block by echoing the bullets back instead of producing the message. One
-# clean paragraph plus one example, followed by an explicit "only output the message"
-# directive, is much less likely to leak.
-DESK_VOICE_PROMPT = """You write short, formal market updates for traders — direct \
-analysis, not hype. Plain, professional sentences: state where price is, what the order \
-flow is doing, which level matters next, and briefly why it matters, so the reader learns \
-something rather than just being handed a number. When there are two ways price could go, \
-lay out both plainly: if it holds X, then Y; if it breaks Z, then W. If there's no clean \
-setup, say so and say to wait — don't invent one. Use the figures exactly as given, worked \
-into normal sentences, not bullet points, no ALL CAPS, no emoji spam, no filler like "let's \
-scale" or "fund those accounts." A handful of sentences is enough. Don't use internal \
-labels like "the desk" or a brand name — write as the analysis itself, not an announcement \
-about who's speaking.
+# Short, plain, human — a real trader giving a quick direct read, not an analyst report
+# and not a bot reciting numbers. Written as plain prose on purpose, not a bulleted
+# "Requirements:" list — small/free-tier models sometimes answer a bulleted instruction
+# block by echoing the bullets back instead of producing the message. One clean paragraph
+# plus one example, followed by an explicit "only output the message" directive, is much
+# less likely to leak.
+DESK_VOICE_PROMPT = """You send quick, plain, direct market updates to a group of traders. \
+Short sentences, everyday words — like a text, not a report. Say where price is, what's \
+happening, and the one level that matters. Skip the essay on why; a few words of reason is \
+plenty ("...4436, that's capped it twice"). If there are two ways it could go, say both in \
+one line: holds X, we look at Y; breaks Z, we look at W. No setup, just say so — wait, don't \
+invent one. Keep the numbers exactly as given. No bullet points, no ALL CAPS, no emoji spam, \
+no hype filler. 2 sentences is often enough, 3-4 only when there's a lot to say. Don't use \
+internal labels like "the desk" or a brand name — just write the read itself.
 
-Example of the register: "Gold is testing 4436 after reclaiming the range high, and that \
-level is the one to watch because it capped the last two pushes higher. If it holds above \
-4436 into London, the setup favors a continuation toward 4480. If it's rejected and closes \
-back under 4436, the more likely path is a retest of 4350. No position until one of those \
-confirms — reacting to the first touch of a level is how stops get run."
+Example of the register: "Gold's testing 4436, that's capped the last two pushes so it's the \
+one to watch. Holds above into London, we like 4480. Loses it, more likely we're back toward \
+4350 — nothing until one of those confirms."
 
 Reply with nothing but the message itself — no headings, no notes about what changed, \
 no markdown, no bullet points, no restating any part of this prompt. The first character \
@@ -1540,39 +1536,34 @@ IMPACT_EMOJI = {"High": "🔴", "Medium": "🟡", "Low": "⚪", "Holiday": "📅
 MAJOR_CCY    = {"USD","EUR","GBP","JPY","AUD","CAD","CHF","NZD"}   # show all, flag these
 
 async def _fetch_news_events() -> list:
-    """Fetch ForexFactory calendar. Tries with User-Agent header (some blocks are UA-based).
+    """Fetch ForexFactory calendar. Tries the primary host then the CDN, with a couple of
+    backoff attempts per host on a 429 (honoring Retry-After when the server sends one).
     Returns raw list of all events or empty list on failure."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; trading-desk-bot/1.0)"}
-    for url in (FF_CAL,):   # CDN URL removed — it doesn't resolve from cloud hosts
-        try:
-            async with HTTP.get(url, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=15)) as r:
-                ctype = r.headers.get("Content-Type", "")
-                if r.status == 429:
-                    log.warning(f"news: 429 from {url} — will retry in 60s")
-                    await asyncio.sleep(60)
-                    # one retry
-                    async with HTTP.get(url, headers=headers,
-                                        timeout=aiohttp.ClientTimeout(total=15)) as r2:
-                        ctype = r2.headers.get("Content-Type", "")
-                        if r2.status != 200 or "json" not in ctype.lower():
-                            log.warning(f"news: retry also failed (status={r2.status})")
-                            return []
-                        evs = await r2.json()
-                        log.info(f"news: {len(evs)} events fetched on retry")
-                        return evs if isinstance(evs, list) else []
-                if r.status != 200:
-                    log.warning(f"news: HTTP {r.status} from {url}")
-                    return []
-                if "json" not in ctype.lower():
-                    body = await r.text()
-                    log.warning(f"news: non-JSON from {url} ({ctype}): {body[:120]}")
-                    return []
-                evs = await r.json()
-                log.info(f"news: {len(evs)} raw events fetched")
-                return evs if isinstance(evs, list) else []
-        except Exception as e:
-            log.warning(f"news: fetch error from {url}: {e}")
+    for url in (FF_CAL, FF_CAL_CDN):
+        for attempt in range(2):
+            try:
+                async with HTTP.get(url, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    ctype = r.headers.get("Content-Type", "")
+                    if r.status == 429:
+                        wait = min(int(r.headers.get("Retry-After", 60) or 60), 120)
+                        log.warning(f"news: 429 from {url} — backing off {wait}s (attempt {attempt+1}/2)")
+                        await asyncio.sleep(wait)
+                        continue   # one retry against the same host, then fall through to next
+                    if r.status != 200:
+                        log.warning(f"news: HTTP {r.status} from {url}")
+                        break      # won't succeed on retry — try the next host instead
+                    if "json" not in ctype.lower():
+                        body = await r.text()
+                        log.warning(f"news: non-JSON from {url} ({ctype}): {body[:120]}")
+                        break
+                    evs = await r.json()
+                    log.info(f"news: {len(evs)} raw events fetched from {url}")
+                    return evs if isinstance(evs, list) else []
+            except Exception as e:
+                log.warning(f"news: fetch error from {url}: {e}")
+                break
     return []
 
 async def news_worker():
@@ -1590,7 +1581,12 @@ async def news_worker():
             if not NEWS["events"]:
                 log.warning(f"news: zero stored — sample raw keys: "
                             f"{list(evs[0].keys()) if evs else 'empty'}")
-        await asyncio.sleep(1800)
+        else:
+            log.warning("news: fetch failed this cycle — keeping previously stored events")
+        # this is a weekly calendar file, not a live feed — polling it every 30 min was
+        # almost certainly what triggered the 429s from a shared cloud IP in the first
+        # place. 3-4h (jittered) is still plenty fresh and far gentler on the endpoint.
+        await asyncio.sleep(random.randint(3 * 3600, 4 * 3600))
 
 def _event_dt(e):
     dt = datetime.fromisoformat(e["date"])
@@ -1757,13 +1753,35 @@ Market right now: BTC at {btc_p} vs VWAP {btc_vw}, Gold at {gold_p} vs VWAP {gol
 {"BTC key levels: " + ", ".join(fp(l['level'], 'BITCOIN') + " (" + l['type'] + ")" for l in liq_b[:2]) if liq_b else ""}
 {"Gold key levels: " + ", ".join(fp(l['level'], 'GOLD') + " (" + l['type'] + ")" for l in liq_g[:2]) if liq_g else ""}
 
-Write a NewsIQ update for traders. Tell them what's dropping and when, what to expect if it beats or misses (specific price scenarios for BTC and Gold), and what levels to watch. End with whether signals are paused. Natural trader voice, max 5 sentences."""
+Write a NewsIQ heads-up for traders. What's dropping, when, and the two scenarios (beat / miss) in plain terms. End with whether signals are paused. Plain and short — 3 sentences, 4 at most."""
     fallback = news_iq_pre(event)
     result = await ai_voice(prompt, fallback=fallback)
     return emoji + " " + result + f"\n\n<i>{BRAND}</i>"
 
-def news_iq_post(snap: dict) -> str:
-    """Post-event: what actually happened. Human voice, static fallback."""
+def _reaction_bias(name: str, chg_pct: float) -> str:
+    """The only place a post-news BUY/SELL call gets decided — a plain rule on real numbers,
+    never left to the model. Price has to have actually moved a meaningful amount AND the
+    live order flow has to agree with that direction. If either isn't true, it's FLAT: no
+    call, because a move with flow disagreeing is exactly the kind of print that fakes out
+    and reverses."""
+    st = next((s for s in STORES if s.name == name), None)
+    if not st:
+        return "FLAT"
+    fs = st if st.cvd_ticks else PROXIES.get(name, st)
+    fm = flow_metrics(fs)
+    min_move = 0.15 if name == "BITCOIN" else 0.10   # % — below this it's noise, not a reaction
+    if not fm or abs(chg_pct) < min_move:
+        return "FLAT"
+    price_dir = "BULL" if chg_pct > 0 else "BEAR"
+    if fm["dir"] != price_dir:
+        return "FLAT"   # price moved but the tape doesn't confirm it
+    return "BUY" if price_dir == "BULL" else "SELL"
+
+async def news_iq_post(snap: dict) -> str:
+    """Post-event: what actually happened, plus a BUY/SELL read when the price reaction and
+    live order flow agree. The call itself always comes from _reaction_bias() on real numbers
+    above — the model's only job is to phrase the numbers it's handed, never to decide the
+    direction itself. A mechanical check below confirms the two match before sending."""
     event = snap["event"]
     title = event.get("title", "?")
     pre_prices = snap.get("pre_prices", {})
@@ -1774,19 +1792,60 @@ def news_iq_post(snap: dict) -> str:
         if st and st.price and pre_p:
             chg = (st.price - pre_p) / pre_p * 100
             arrow = "▲" if chg > 0 else "▼"
-            moves.append((name, chg, arrow, fp(pre_p, name), fp(st.price, name)))
+            moves.append({"name": name, "chg": chg, "arrow": arrow,
+                          "pre": fp(pre_p, name), "post": fp(st.price, name),
+                          "bias": _reaction_bias(name, chg)})
     if not moves:
         return ""
+
     lines = [f"🧠 {title.upper()} — aftermath (10min)"]
-    for name, chg, arrow, pre, post in moves:
-        lines.append(f"{name}: {arrow}{abs(chg):.2f}% · {pre} → {post}")
+    for m in moves:
+        lines.append(f"{m['name']}: {m['arrow']}{abs(m['chg']):.2f}% · {m['pre']} → {m['post']}")
     if db:
-        beat_rx = db[1]
-        lines.append(f"Expected on beat: {beat_rx}")
-    biggest = max(moves, key=lambda x: abs(x[1]))
-    direction = "with the expected beat reaction" if biggest[1] > 0 else "against the beat — market faded the number"
-    lines.append(f"Market moved {direction}. Watch for follow-through or a reversal back to VWAP.")
-    return "\n".join(lines) + f"\n\n<i>{BRAND}</i>"
+        lines.append(f"Expected on beat: {db[1]}")
+    called = [m for m in moves if m["bias"] != "FLAT"]
+    lines.append(
+        "; ".join(f"{m['name']}: {m['bias']} — price and flow agree" for m in called)
+        if called else "No clean call — reaction and flow don't agree yet, stand by."
+    )
+    static = "\n".join(lines) + f"\n\n<i>{BRAND}</i>"
+
+    evidence = [f"Event: {title}"]
+    for m in moves:
+        fs = next((s for s in STORES if s.name == m["name"]), None)
+        fs = fs if fs and fs.cvd_ticks else PROXIES.get(m["name"], fs)
+        fm = flow_metrics(fs) if fs else None
+        evidence.append(
+            f"{m['name']}: moved {m['arrow']}{abs(m['chg']):.2f}% from {m['pre']} to {m['post']}, "
+            f"order flow right now is {fm['dir'] if fm else 'unclear'} "
+            f"({fm['conv'] if fm else '—'} conviction) — computed read: {m['bias']}"
+        )
+    if db:
+        evidence.append(f"Expected reaction on a beat: {db[1]}. On a miss: {db[2]}")
+    prompt = "\n".join(evidence) + (
+        "\n\nWrite the 10-minutes-after update. State each asset's move with the exact "
+        "numbers given. Then give the call using ONLY the 'computed read' value already "
+        "provided for each asset — BUY, SELL, or no clean call yet if it says FLAT. Don't "
+        "decide the direction yourself, just report what's given. If there's a call, one "
+        "short reason (price and flow agreeing is the evidence). Plain, short, direct — "
+        "2-3 sentences."
+    )
+    result = await ai_voice(prompt, fallback=static)
+
+    # Mechanical check: the message actually sent must match what was computed above —
+    # not what the model felt like saying. A financial call is exactly the wrong place to
+    # trust free-tier-model instruction-following alone.
+    up = result.upper()
+    computed = {m["bias"] for m in called}
+    fabricated = not computed and ("BUY" in up or "SELL" in up)
+    dropped    = computed and not any(b in up for b in computed)
+    if fabricated or dropped:
+        log.warning(f"news_iq_post: AI call {('fabricated a direction' if fabricated else 'dropped the computed call')} — using static")
+        result = static.replace(f"\n\n<i>{BRAND}</i>", "")
+
+    return result + f"\n\n<i>{BRAND}</i>"
+
+
 
 # ---------------------------------------------------------------- FORMATTING
 def header(title: str) -> str:
@@ -2262,7 +2321,7 @@ async def tick_worker(stores, proxies, h4, ctx):
                 dt_aware = dt if dt.tzinfo else dt.replace(tzinfo=pytz.utc)
                 elapsed = (now_utc - dt_aware).total_seconds()
                 if 540 <= elapsed <= 660:   # 9-11 min after print
-                    post = news_iq_post(snap)
+                    post = await news_iq_post(snap)
                     if post:
                         msgs.append(post)
                     snap["post_sent"] = True
@@ -2309,6 +2368,7 @@ async def tick_worker(stores, proxies, h4, ctx):
         await asyncio.sleep(TICK_INTERVAL)
 
 FLOW_INTERVAL_SEC = (15 * 60, 20 * 60)   # random 15-20 min between flow updates
+_FLOW_MSG_COUNT = {}                     # per-asset counter — gates how often a chart is attached
 
 async def flow_update_worker(stores):
     while True:
@@ -2353,13 +2413,17 @@ async def flow_update_worker(stores):
             dir_word = "Bullish" if fm and fm["dir"] == "BULL" else "Bearish" if fm and fm["dir"] == "BEAR" else "Mixed"
             static_flow = f"{st.name} — {t_str}. {dir_word} tape at {fp(p, st.name) if p else '—'}."
             prompt = "\n".join(ctx_bits) + (
-                "\n\nWrite a short, formal update on this one asset only — do not mention "
-                "the other asset. State where price is, what the order flow is doing, and "
-                "the single nearest level that matters, with a brief line on why that level "
-                "matters. Direct, professional register, no hype, no slang. 3-4 sentences."
+                "\n\nWrite a short update on this one asset only — do not mention the other "
+                "asset. Where's price, what's the flow doing, one level that matters. Plain "
+                "everyday words, like a quick text to a friend who trades — not a report. "
+                "2 sentences, 3 at most."
             )
             msg = await ai_voice(prompt, fallback=static_flow)
-            png = render_chart_bytes(st)
+            # chart on roughly 1 in 3 updates (~hourly at this cadence) — not every message,
+            # so the group gets a picture when it's actually been a while, not a wall of images
+            _FLOW_MSG_COUNT[st.name] = _FLOW_MSG_COUNT.get(st.name, 0) + 1
+            send_chart = _FLOW_MSG_COUNT[st.name] % 3 == 0
+            png = render_chart_bytes(st) if send_chart else None
             if png:
                 await tg_photo(png, send_with_footer(msg))
             else:
@@ -2402,7 +2466,7 @@ async def daily_outlook_worker(stores, proxies, h4):
                 if liq: ctx_bits.append(f"Liquidity pools: " + ", ".join(f"{fp(l['level'], st.name)} ({l['type']}, {l['distance_pct']:+.1f}%)" for l in liq[:2]))
             news = [e.get("title") for e in NEWS["events"] if e.get("impact") == "High"]
             if news: ctx_bits.append(f"\nHigh-impact news today: {', '.join(news)}")
-            prompt = "\n".join(ctx_bits) + "\n\nWrite the morning trading outlook for the group. Give the bias, key levels to watch, two scenarios (if it holds X / if it breaks Y), and end with motivation or a reminder."
+            prompt = "\n".join(ctx_bits) + "\n\nWrite the morning outlook for the group. Plain, short: the bias, the one or two levels that matter, holds X we look Y / breaks Z we look W. End with one quick line, not a speech. 4 sentences, 5 at most."
             # human static fallback — used if AI unavailable
             static_outlook = build_daily_outlook(stores, proxies, h4)
             msg = await ai_voice(prompt, fallback=static_outlook)
@@ -2501,7 +2565,7 @@ async def session_worker(stores, proxies, h4, ctx):
             static_fallback = (f"🔔 <b>{s} OPEN · {t.strftime('%H:%M EAT')}</b>\n\n"
                                + random.choice(SESSION_OPEN.get(s, ["Session live."])) + "\n\n"
                                + "\n".join(asset_lines))
-            prompt = "\n".join(ctx_bits) + "\n\nWrite a session open update for traders. What just opened, what's the bias, what levels matter, and what are the two scenarios they should watch for. End with encouragement or a warning."
+            prompt = "\n".join(ctx_bits) + "\n\nWrite a quick session-open update. What just opened, where price is, the one level that matters. Plain and short — 3 sentences, 4 at most."
             msg = await ai_voice(prompt, fallback=static_fallback)
             await tg_send(send_with_footer(msg))
         if not s and now_eat().hour >= 21:
